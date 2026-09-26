@@ -36,4 +36,5 @@ forbid() {
 }
 forbid json host tui bistill bistill-lib
 forbid host json tui bistill bistill-lib
+forbid bistill-lib tui bistill
 exit "$fail"
