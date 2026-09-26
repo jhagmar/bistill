@@ -16,4 +16,24 @@ for f in $(find . -name Cargo.toml -not -path './target/*'); do
     fail=1
   fi
 done
+
+forbid() {
+  crate=$1
+  file="crates/$crate/Cargo.toml"
+  shift
+  [ -f "$file" ] || return 0
+  for dep in "$@"; do
+    if awk -v dep="$dep" '
+      /^\[(dependencies|dev-dependencies|build-dependencies)(\..*)?\]/ { d = 1; next }
+      /^\[/ { d = 0 }
+      d && $0 ~ "^[[:space:]]*" dep "[[:space:]]*=" { found = 1 }
+      END { exit found ? 0 : 1 }
+    ' "$file"; then
+      echo "$crate depends on $dep" >&2
+      fail=1
+    fi
+  done
+}
+forbid json host tui bistill bistill-lib
+forbid host json tui bistill bistill-lib
 exit "$fail"

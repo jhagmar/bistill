@@ -1,0 +1,297 @@
+//! Run a named program on this machine, and HTTP GET through `curl`.
+//!
+//! The child is the program named by the caller, started from an argument vector.
+//! There is no shell. This crate does not print request headers. The argument
+//! vector passed to `curl` does not include `--insecure`. `curl` still honors
+//! `http_proxy`, `https_proxy`, and `no_proxy`.
+
+#![deny(unsafe_code)]
+
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// Why a program or a GET failed.
+#[derive(Debug)]
+pub enum Error {
+    /// `program` is not on `PATH`.
+    Missing { program: String },
+    /// The process exceeded its timeout, or `curl` reported one.
+    Timeout { program: String },
+    /// The process did not start, or it finished without an HTTP status.
+    Failed { program: String, message: String },
+    /// TLS verification or the TLS handshake failed.
+    Tls { message: String },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Missing { program } => write!(f, "{program} is not on PATH"),
+            Error::Timeout { program } => write!(f, "{program} timed out"),
+            Error::Failed { program, message } => write!(f, "{program} failed: {message}"),
+            Error::Tls { message } => write!(f, "TLS failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Exit status and captured output of a finished process.
+#[derive(Debug)]
+pub struct Output {
+    /// Process exit code.
+    pub code: i32,
+    /// Bytes written to stdout.
+    pub stdout: Vec<u8>,
+    /// Bytes written to stderr.
+    pub stderr: Vec<u8>,
+}
+
+/// One HTTP GET. `headers` are `Name: value` strings, passed to `curl` as `-H`.
+///
+/// `program` is `curl` or `curl.exe`. `user_agent` is the `-A` value.
+#[derive(Clone)]
+pub struct Request {
+    /// Program on `PATH`.
+    pub program: String,
+    /// Request URL.
+    pub url: String,
+    /// Header lines, each `Name: value`.
+    pub headers: Vec<String>,
+    /// `User-Agent` value.
+    pub user_agent: String,
+    /// Limit for `curl --max-time`. The process is killed one second later.
+    pub timeout: Duration,
+    /// Optional `--cacert` path.
+    pub ca_file: Option<PathBuf>,
+    /// Pass `--fail-with-body`. The HTTP status is still returned.
+    pub fail_with_body: bool,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<String> = self.headers.iter().map(|header| redact(header)).collect();
+        f.debug_struct("Request")
+            .field("program", &self.program)
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .field("user_agent", &self.user_agent)
+            .field("timeout", &self.timeout)
+            .field("ca_file", &self.ca_file)
+            .field("fail_with_body", &self.fail_with_body)
+            .finish()
+    }
+}
+
+/// HTTP status and body. 4xx and 5xx are a completed GET.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Response {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response body.
+    pub body: Vec<u8>,
+}
+
+/// Run `program` with `args` and stop it after `timeout`.
+///
+/// A missing program, a timeout, and a failed spawn are distinct errors.
+pub fn run(program: &str, args: &[OsString], timeout: Duration) -> Result<Output, Error> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::Missing {
+                program: program.to_owned(),
+            });
+        }
+        Err(err) => {
+            return Err(Error::Failed {
+                program: program.to_owned(),
+                message: err.to_string(),
+            });
+        }
+    };
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_thread = thread::spawn(move || read_to_end(&mut stdout));
+    let stderr_thread = thread::spawn(move || read_to_end(&mut stderr));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("wait for child") {
+            Some(status) => break status,
+            None if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(Error::Timeout {
+                    program: program.to_owned(),
+                });
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = stdout_thread.join().expect("stdout thread");
+    let stderr = stderr_thread.join().expect("stderr thread");
+    let Some(code) = status.code() else {
+        return Err(Error::Failed {
+            program: program.to_owned(),
+            message: "exited by signal".to_owned(),
+        });
+    };
+    Ok(Output {
+        code,
+        stdout,
+        stderr,
+    })
+}
+
+/// Argument vector for [`get`]. This is the vector `curl` receives.
+///
+/// ```
+/// use std::time::Duration;
+/// let request = host::Request {
+///     program: "curl".to_owned(),
+///     url: "https://git.example.invalid/rest".to_owned(),
+///     headers: vec!["Accept: application/json".to_owned()],
+///     user_agent: "bistill/0.1.0 (internal)".to_owned(),
+///     timeout: Duration::from_secs(15),
+///     ca_file: None,
+///     fail_with_body: false,
+/// };
+/// let args = host::arguments(&request);
+/// assert!(args.iter().any(|arg| arg == "-sS"));
+/// assert!(args.iter().any(|arg| arg == "15"));
+/// assert!(!args.iter().any(|arg| arg == "--insecure"));
+/// ```
+pub fn arguments(request: &Request) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("-sS"),
+        OsString::from("--max-time"),
+        OsString::from(max_time(request.timeout)),
+        OsString::from("-A"),
+        OsString::from(&request.user_agent),
+    ];
+    for header in &request.headers {
+        args.push(OsString::from("-H"));
+        args.push(OsString::from(header));
+    }
+    if let Some(path) = &request.ca_file {
+        args.push(OsString::from("--cacert"));
+        args.push(path.as_os_str().to_owned());
+    }
+    if request.fail_with_body {
+        args.push(OsString::from("--fail-with-body"));
+    }
+    args.push(OsString::from("-w"));
+    args.push(OsString::from("\n%{http_code}"));
+    args.push(OsString::from(&request.url));
+    args
+}
+
+/// GET `request.url` through `curl`.
+pub fn get(request: &Request) -> Result<Response, Error> {
+    let args = arguments(request);
+    let kill_after = request.timeout.saturating_add(Duration::from_secs(1));
+    let output = run(&request.program, &args, kill_after)?;
+    interpret(&request.program, &output)
+}
+
+pub(crate) fn interpret(program: &str, output: &Output) -> Result<Response, Error> {
+    if output.code == 28 {
+        return Err(Error::Timeout {
+            program: program.to_owned(),
+        });
+    }
+    if is_tls(output.code) {
+        return Err(Error::Tls {
+            message: detail(output.code, &output.stderr),
+        });
+    }
+    if let Some((status, body)) = split_status(&output.stdout) {
+        return Ok(Response { status, body });
+    }
+    Err(Error::Failed {
+        program: program.to_owned(),
+        message: detail(output.code, &output.stderr),
+    })
+}
+
+fn read_to_end(pipe: &mut impl Read) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    buf
+}
+
+fn max_time(timeout: Duration) -> String {
+    let millis = timeout.as_millis() as u64;
+    let whole = millis / 1000;
+    let frac = millis % 1000;
+    if frac == 0 {
+        return format!("{whole}");
+    }
+    let mut text = format!("{whole}.{frac:03}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    text
+}
+
+fn split_status(stdout: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let split = stdout.iter().rposition(|byte| *byte == b'\n')?;
+    let code = &stdout[split + 1..];
+    if code.len() != 3 {
+        return None;
+    }
+    let mut status: u16 = 0;
+    for byte in code {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        status = status * 10 + u16::from(*byte - b'0');
+    }
+    if !(100..600).contains(&status) {
+        return None;
+    }
+    Some((status, stdout[..split].to_vec()))
+}
+
+fn detail(code: i32, stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        format!("curl exited {code}")
+    } else {
+        format!("curl exited {code}: {text}")
+    }
+}
+
+fn is_tls(code: i32) -> bool {
+    matches!(
+        code,
+        35 | 51 | 53 | 54 | 58 | 59 | 60 | 64 | 66 | 77 | 80 | 82 | 83 | 90 | 91
+    )
+}
+
+fn redact(header: &str) -> String {
+    let Some((name, _)) = header.split_once(':') else {
+        return header.to_owned();
+    };
+    if name.trim().eq_ignore_ascii_case("authorization") {
+        format!("{}: ***", name.trim())
+    } else {
+        header.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests;
