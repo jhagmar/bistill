@@ -1,6 +1,6 @@
 [package]
 name = "bistill-lib"
-description = "Config and the process error type."
+description = "Config, errors, and the Bitbucket ping reads."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

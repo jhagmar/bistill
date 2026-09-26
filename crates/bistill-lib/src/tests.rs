@@ -2,7 +2,11 @@ use super::*;
 use crate::config::{nonempty, path_from, sample_state};
 use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn env_token() -> Env {
     let mut env = Env::new();
@@ -416,4 +420,342 @@ fn unix_token_file_mode() {
     env.token_file = Some(dir.join("absent-token"));
     let err = load(&dir, &Flags::default(), &env).unwrap_err();
     assert!(err.to_string().contains("cannot read"));
+}
+
+const APP: &str = include_str!("../../../fixtures/application-properties.json");
+const USER_JSON: &str = include_str!("../../../fixtures/user.json");
+const COUNT_SPLIT: &str = include_str!("../../../fixtures/inbox-count.json");
+const COUNT_TOTAL: &str = include_str!("../../../fixtures/inbox-count-total.json");
+
+fn ping_client(base: &str, username: &str) -> Client {
+    let mut env = env_token();
+    env.base_url = Some(base.to_owned());
+    env.username = Some(username.to_owned());
+    let config = load(Path::new("/no-bistill-cwd"), &Flags::default(), &env).unwrap();
+    Client::new("curl", &config)
+}
+
+struct Queue {
+    steps: Vec<Result<host::Response, host::Error>>,
+    urls: Vec<String>,
+}
+
+impl Fetch for Queue {
+    fn get(&mut self, request: &host::Request) -> Result<host::Response, host::Error> {
+        self.urls.push(request.url.clone());
+        self.steps.remove(0)
+    }
+}
+
+fn step(status: u16, body: &str) -> Result<host::Response, host::Error> {
+    Ok(host::Response {
+        status,
+        body: body.as_bytes().to_vec(),
+    })
+}
+
+fn run_ping(
+    username: &str,
+    steps: Vec<Result<host::Response, host::Error>>,
+) -> (Result<Report, Error>, Vec<String>) {
+    let client = ping_client("https://git.example.invalid", username);
+    let mut queue = Queue {
+        steps,
+        urls: Vec::new(),
+    };
+    let result = ping_with(&client, &mut queue);
+    (result, queue.urls)
+}
+
+#[test]
+fn exit_codes_follow_the_spec() {
+    let cases = [
+        (
+            Error::Curl(CurlFault::Missing {
+                program: "curl".to_owned(),
+            }),
+            2,
+        ),
+        (Error::Tls("verify".to_owned()), 3),
+        (
+            Error::Curl(CurlFault::Timeout {
+                program: "curl".to_owned(),
+            }),
+            4,
+        ),
+        (Error::Json(json::parse(b"{").unwrap_err()), 5),
+        (Error::Http(401), 11),
+        (Error::Http(403), 12),
+        (Error::Http(404), 13),
+        (Error::Http(500), 10),
+        (
+            Error::Curl(CurlFault::Failed {
+                program: "curl".to_owned(),
+                message: "exit 7".to_owned(),
+            }),
+            1,
+        ),
+        (Error::Config(ConfigFault::Missing { key: "base_url" }), 1),
+        (Error::Auth("slug mismatch".to_owned()), 1),
+        (Error::Io(std::io::Error::other("disk")), 1),
+    ];
+    for (err, code) in cases {
+        assert_eq!(exit_code(&err), code, "{err}");
+    }
+}
+
+#[test]
+fn request_carries_bearer_agent_and_ca() {
+    let dir = temp("ping-ca");
+    fs::write(dir.join("bistill.conf"), "ca_file = /corp/root.pem\n").unwrap();
+    let config = load(&dir, &Flags::default(), &env_token()).unwrap();
+    let client = Client::new("curl", &config);
+    let request = client.request("/rest/api/1.0/application-properties");
+    assert_eq!(request.timeout, TIMEOUT);
+    assert_eq!(request.user_agent, "bistill/0.1.0 (internal)");
+    assert!(request.fail_with_body);
+    assert_eq!(
+        request.ca_file.as_deref(),
+        Some(Path::new("/corp/root.pem"))
+    );
+    let text = redact_argv(&host::arguments(&request)).join(" ");
+    assert!(text.contains("Bearer ***"));
+    assert!(!text.contains("secret-token"));
+    assert!(text.contains("--cacert"));
+    assert!(text.contains("--fail-with-body"));
+    assert!(text.contains("--max-time"));
+    let debug = format!("{client:?}");
+    assert!(debug.contains("***"));
+    assert!(!debug.contains("secret-token"));
+    let bare = ping_client("https://git.example.invalid", "jcitizen");
+    assert!(bare.request("/").ca_file.is_none());
+    relax(&dir);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fixtures_parse_without_network() {
+    let product = parse_product(APP.as_bytes()).unwrap();
+    assert_eq!(product.display_name, "Bitbucket");
+    assert_eq!(product.version, "8.19.0");
+    let user = parse_user("Jcitizen", USER_JSON.as_bytes()).unwrap();
+    assert_eq!(user.slug, "jcitizen");
+    assert_eq!(user.display_name, "Jane Citizen");
+    let split = parse_inbox(COUNT_SPLIT.as_bytes()).unwrap();
+    assert_eq!(split.to_string(), "reviewer 2, author 1");
+    let total = parse_inbox(COUNT_TOTAL.as_bytes()).unwrap();
+    assert_eq!(total.to_string(), "3");
+    let both = parse_inbox(br#"{"reviewer":2,"author":1,"count":9}"#).unwrap();
+    assert!(matches!(
+        both,
+        InboxCount::Split {
+            reviewer: 2,
+            author: 1
+        }
+    ));
+    let partial = parse_inbox(br#"{"reviewer":1,"count":4}"#).unwrap();
+    assert!(matches!(partial, InboxCount::Total(4)));
+    let zero = parse_inbox(br#"{"count":0}"#).unwrap();
+    assert!(matches!(zero, InboxCount::Total(0)));
+    let _ = format!("{product:?} {user:?} {split:?} {total:?} {both:?} {partial:?} {zero:?}");
+}
+
+#[test]
+fn parsers_reject_bad_shapes() {
+    assert!(parse_product(b"{").is_err());
+    assert!(parse_user("jcitizen", b"{").is_err());
+    assert!(parse_inbox(b"{").is_err());
+    let missing = parse_product(b"{}").unwrap_err();
+    assert!(missing.to_string().contains("missing displayName"));
+    let kind = parse_product(br#"{"displayName":1}"#).unwrap_err();
+    assert!(kind.to_string().contains("displayName is not a string"));
+    let version = parse_product(br#"{"displayName":"Bitbucket"}"#).unwrap_err();
+    assert!(version.to_string().contains("missing version"));
+    let slug = parse_user("jcitizen", b"{}").unwrap_err();
+    assert!(slug.to_string().contains("missing slug"));
+    let mismatch = parse_user("jcitizen", br#"{"slug":"other","displayName":"O"}"#).unwrap_err();
+    assert!(matches!(mismatch, Error::Auth(_)));
+    assert!(
+        mismatch
+            .to_string()
+            .contains("slug other does not match username jcitizen")
+    );
+    let no_name = parse_user("jcitizen", br#"{"slug":"jcitizen"}"#).unwrap_err();
+    assert!(no_name.to_string().contains("missing displayName"));
+    let count = parse_inbox(br#"{"reviewer":1}"#).unwrap_err();
+    assert!(count.to_string().contains("missing inbox count"));
+    let text = parse_inbox(br#"{"count":"3"}"#).unwrap_err();
+    assert!(text.to_string().contains("missing inbox count"));
+}
+
+#[test]
+fn ping_reads_product_user_and_split_count() {
+    let (result, urls) = run_ping(
+        "Jcitizen",
+        vec![
+            step(302, ""),
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, COUNT_SPLIT),
+        ],
+    );
+    let report = result.unwrap();
+    assert_eq!(report.product.version, "8.19.0");
+    assert_eq!(report.user.slug, "jcitizen");
+    assert_eq!(report.inbox.to_string(), "reviewer 2, author 1");
+    assert_eq!(report.bodies.application_properties, APP.as_bytes());
+    assert_eq!(report.bodies.user, USER_JSON.as_bytes());
+    assert_eq!(report.bodies.inbox_count, COUNT_SPLIT.as_bytes());
+    assert_eq!(
+        urls,
+        vec![
+            "https://git.example.invalid/".to_owned(),
+            "https://git.example.invalid/rest/api/1.0/application-properties".to_owned(),
+            "https://git.example.invalid/rest/api/1.0/users/Jcitizen".to_owned(),
+            "https://git.example.invalid/rest/api/1.0/inbox/pull-requests/count".to_owned(),
+        ]
+    );
+    let _ = format!("{report:?}");
+}
+
+#[test]
+fn ping_reads_a_single_count() {
+    let (result, _) = run_ping(
+        "jcitizen",
+        vec![
+            step(200, "ok"),
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, COUNT_TOTAL),
+        ],
+    );
+    let report = result.unwrap();
+    assert!(matches!(report.inbox, InboxCount::Total(3)));
+    let _ = format!("{:?}", report.inbox);
+}
+
+#[test]
+fn ping_stops_when_the_origin_times_out() {
+    let (result, urls) = run_ping(
+        "jcitizen",
+        vec![Err(host::Error::Timeout {
+            program: "curl".to_owned(),
+        })],
+    );
+    assert!(matches!(
+        result,
+        Err(Error::Curl(CurlFault::Timeout { .. }))
+    ));
+    assert_eq!(urls.len(), 1);
+}
+
+#[test]
+fn ping_stops_when_application_properties_fails() {
+    let (timed_out, _) = run_ping(
+        "jcitizen",
+        vec![
+            step(200, "ok"),
+            Err(host::Error::Tls {
+                message: "verify".to_owned(),
+            }),
+        ],
+    );
+    assert!(matches!(timed_out, Err(Error::Tls(_))));
+    let (denied, urls) = run_ping("jcitizen", vec![step(302, ""), step(401, "no")]);
+    assert!(matches!(denied, Err(Error::Http(401))));
+    assert_eq!(urls.len(), 2);
+    let (bad, _) = run_ping("jcitizen", vec![step(200, "ok"), step(200, "{")]);
+    assert!(matches!(bad, Err(Error::Json(_))));
+}
+
+#[test]
+fn ping_stops_when_the_user_call_fails() {
+    let (missing, urls) = run_ping("a/b", vec![step(200, "ok"), step(200, APP), step(404, "")]);
+    assert!(matches!(missing, Err(Error::Http(404))));
+    assert_eq!(
+        urls[2],
+        "https://git.example.invalid/rest/api/1.0/users/a%2Fb"
+    );
+    let (mismatch, seen) = run_ping(
+        "jcitizen",
+        vec![
+            step(200, "ok"),
+            step(200, APP),
+            step(200, r#"{"slug":"other","displayName":"O"}"#),
+        ],
+    );
+    assert!(matches!(mismatch, Err(Error::Auth(_))));
+    assert_eq!(seen.len(), 3);
+}
+
+#[test]
+fn ping_stops_when_the_count_fails() {
+    let (denied, urls) = run_ping(
+        "jcitizen",
+        vec![
+            step(200, "ok"),
+            step(200, APP),
+            step(200, USER_JSON),
+            step(403, "no"),
+        ],
+    );
+    assert!(matches!(denied, Err(Error::Http(403))));
+    assert_eq!(urls.len(), 4);
+    let (bad, _) = run_ping(
+        "jcitizen",
+        vec![
+            step(200, "ok"),
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, "{"),
+        ],
+    );
+    assert!(matches!(bad, Err(Error::Json(_))));
+}
+
+#[test]
+fn ping_through_curl_reads_a_local_server() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let thread = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut done = 0;
+        while done < 4 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body: &[u8] = if req.contains("application-properties") {
+                        APP.as_bytes()
+                    } else if req.contains("/users/") {
+                        USER_JSON.as_bytes()
+                    } else if req.contains("pull-requests/count") {
+                        COUNT_SPLIT.as_bytes()
+                    } else {
+                        b"ok"
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(body);
+                    done += 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let client = ping_client(&format!("http://127.0.0.1:{port}"), "jcitizen");
+    let report = ping(&client).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(report.product.display_name, "Bitbucket");
+    assert_eq!(report.user.display_name, "Jane Citizen");
+    assert_eq!(report.inbox.to_string(), "reviewer 2, author 1");
+    thread.join().expect("server");
 }
