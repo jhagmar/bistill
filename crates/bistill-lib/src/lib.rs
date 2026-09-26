@@ -1,13 +1,19 @@
-//! Config and the process error type.
+//! Config, the process error type, and the Bitbucket reads `ping` performs.
 //!
-//! This crate owns `key = value` config, environment and flag overrides, and
-//! [`Error`]. It does not draw a terminal and it does not call Bitbucket.
+//! This crate owns `key = value` config, environment and flag overrides,
+//! [`Error`], and the application-properties, user, and inbox-count calls.
+//! It does not draw a terminal.
 
 #![deny(unsafe_code)]
 
 mod config;
+mod ping;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
+pub use ping::{
+    Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
+    parse_inbox, parse_product, parse_user, ping, ping_with,
+};
 
 use std::ffi::OsString;
 
@@ -147,6 +153,26 @@ impl From<json::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+/// Process status for `err`, as specified for `bistill ping`.
+///
+/// A finished ping is status 0 at the binary. `Curl` `Failed`, config, auth, and I/O are 1.
+pub fn exit_code(err: &Error) -> i32 {
+    match err {
+        Error::Curl(CurlFault::Missing { .. }) => 2,
+        Error::Tls(_) => 3,
+        Error::Curl(CurlFault::Timeout { .. }) => 4,
+        Error::Json(_) => 5,
+        Error::Http(401) => 11,
+        Error::Http(403) => 12,
+        Error::Http(404) => 13,
+        Error::Http(_) => 10,
+        Error::Curl(CurlFault::Failed { .. }) => 1,
+        Error::Config(_) => 1,
+        Error::Auth(_) => 1,
+        Error::Io(_) => 1,
     }
 }
 
