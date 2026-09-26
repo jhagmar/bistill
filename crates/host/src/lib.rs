@@ -1,4 +1,4 @@
-//! Run a named program on this machine, and HTTP GET through `curl`.
+//! Run a named program on this machine, HTTP GET through `curl`, an OS toast, and open a URL.
 //!
 //! The child is the program named by the caller, started from an argument vector.
 //! There is no shell. This crate does not print request headers. The argument
@@ -21,7 +21,7 @@ pub enum Error {
     Missing { program: String },
     /// The process exceeded its timeout, or `curl` reported one.
     Timeout { program: String },
-    /// The process did not start, or it finished without an HTTP status.
+    /// The process did not start, exited by signal, or finished without a usable result.
     Failed { program: String, message: String },
     /// TLS verification or the TLS handshake failed.
     Tls { message: String },
@@ -214,7 +214,7 @@ pub(crate) fn interpret(program: &str, output: &Output) -> Result<Response, Erro
     }
     if is_tls(output.code) {
         return Err(Error::Tls {
-            message: detail(output.code, &output.stderr),
+            message: detail(program, output.code, &output.stderr),
         });
     }
     if let Some((status, body)) = split_status(&output.stdout) {
@@ -222,8 +222,111 @@ pub(crate) fn interpret(program: &str, output: &Output) -> Result<Response, Erro
     }
     Err(Error::Failed {
         program: program.to_owned(),
-        message: detail(output.code, &output.stderr),
+        message: detail(program, output.code, &output.stderr),
     })
+}
+
+/// One OS toast. Each variant carries the fields that program accepts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Toast {
+    /// `notify-send`. `--action` implies `--wait`, so this variant has no click URL.
+    NotifySend {
+        /// Program on `PATH`.
+        program: String,
+        /// Notification title.
+        title: String,
+        /// Notification body.
+        body: String,
+        /// `--expire-time` in milliseconds, when set.
+        expire: Option<Duration>,
+        /// Limit for the process.
+        timeout: Duration,
+    },
+    /// PowerShell `Windows.UI.Notifications`. `url` is protocol activation on click.
+    PowerShell {
+        /// Program on `PATH`.
+        program: String,
+        /// Notification title.
+        title: String,
+        /// Notification body.
+        body: String,
+        /// Opened when the toast is clicked, when set.
+        url: Option<String>,
+        /// Limit for the process.
+        timeout: Duration,
+    },
+}
+
+/// Argument vector for [`toast`].
+pub fn toast_arguments(toast: &Toast) -> Vec<OsString> {
+    match toast {
+        Toast::NotifySend {
+            title,
+            body,
+            expire,
+            ..
+        } => notify_send_args(title, body, *expire),
+        Toast::PowerShell {
+            title, body, url, ..
+        } => powershell_command(&powershell_show(title, body, url.as_deref())),
+    }
+}
+
+/// Show `toast`. A missing program or a non-zero exit is an error.
+pub fn toast(toast: &Toast) -> Result<(), Error> {
+    let args = toast_arguments(toast);
+    match toast {
+        Toast::NotifySend {
+            program, timeout, ..
+        }
+        | Toast::PowerShell {
+            program, timeout, ..
+        } => launch(program, &args, *timeout),
+    }
+}
+
+/// Open a URL in the registered application.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Open {
+    /// `xdg-open` with the URL as its argument.
+    XdgOpen {
+        /// Program on `PATH`.
+        program: String,
+        /// URL passed to the program.
+        url: String,
+        /// Limit for the process.
+        timeout: Duration,
+    },
+    /// PowerShell `Start-Process -Verb Open`.
+    WindowsStart {
+        /// Program on `PATH`.
+        program: String,
+        /// URL passed to `Start-Process -FilePath`.
+        url: String,
+        /// Limit for the process.
+        timeout: Duration,
+    },
+}
+
+/// Argument vector for [`open_url`].
+pub fn open_arguments(open: &Open) -> Vec<OsString> {
+    match open {
+        Open::XdgOpen { url, .. } => vec![OsString::from(url)],
+        Open::WindowsStart { url, .. } => powershell_command(&windows_start(url)),
+    }
+}
+
+/// Open `open`'s URL. A missing program or a non-zero exit is an error.
+pub fn open_url(open: &Open) -> Result<(), Error> {
+    let args = open_arguments(open);
+    match open {
+        Open::XdgOpen {
+            program, timeout, ..
+        }
+        | Open::WindowsStart {
+            program, timeout, ..
+        } => launch(program, &args, *timeout),
+    }
 }
 
 fn read_to_end(pipe: &mut impl Read) -> Vec<u8> {
@@ -265,15 +368,119 @@ fn split_status(stdout: &[u8]) -> Option<(u16, Vec<u8>)> {
     Some((status, stdout[..split].to_vec()))
 }
 
-fn detail(code: i32, stderr: &[u8]) -> String {
+fn exited_ok(program: &str, output: &Output) -> Result<(), Error> {
+    if output.code == 0 {
+        Ok(())
+    } else {
+        Err(Error::Failed {
+            program: program.to_owned(),
+            message: detail(program, output.code, &output.stderr),
+        })
+    }
+}
+
+fn launch(program: &str, args: &[OsString], timeout: Duration) -> Result<(), Error> {
+    let output = run(program, args, timeout)?;
+    exited_ok(program, &output)
+}
+
+fn notify_send_args(title: &str, body: &str, expire: Option<Duration>) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if let Some(expire) = expire {
+        args.push(OsString::from("--expire-time"));
+        args.push(OsString::from(expire.as_millis().to_string()));
+    }
+    args.push(OsString::from("--"));
+    args.push(OsString::from(title));
+    args.push(OsString::from(body));
+    args
+}
+
+fn powershell_command(script: &str) -> Vec<OsString> {
+    vec![
+        OsString::from("-NoProfile"),
+        OsString::from("-NonInteractive"),
+        OsString::from("-Command"),
+        OsString::from(script),
+    ]
+}
+
+fn powershell_show(title: &str, body: &str, url: Option<&str>) -> String {
+    let xml = match url {
+        Some(url) => format!(
+            "<toast activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+            xml_escape(url),
+            xml_escape(title),
+            xml_escape(body)
+        ),
+        None => format!(
+            "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+            xml_escape(title),
+            xml_escape(body)
+        ),
+    };
+    let mut script = String::from(
+        "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; ",
+    );
+    script.push_str(
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null; ",
+    );
+    script.push_str("$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; $xml.LoadXml(");
+    script.push_str(&ps_single(&xml));
+    script.push_str("); $toast = [Windows.UI.Notifications.ToastNotification]::new($xml); ");
+    script.push_str("[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(");
+    script.push_str(&ps_single(POWERSHELL_APP_ID));
+    script.push_str(").Show($toast)");
+    script
+}
+
+fn windows_start(url: &str) -> String {
+    let mut script = String::from("Start-Process -FilePath ");
+    script.push_str(&ps_single(url));
+    script.push_str(" -Verb Open");
+    script
+}
+
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn ps_single(text: &str) -> String {
+    let mut out = String::from("'");
+    for ch in text.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn detail(program: &str, code: i32, stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let text = text.trim();
     if text.is_empty() {
-        format!("curl exited {code}")
+        format!("{program} exited {code}")
     } else {
-        format!("curl exited {code}: {text}")
+        format!("{program} exited {code}: {text}")
     }
 }
+
+const POWERSHELL_APP_ID: &str =
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
 fn is_tls(code: i32) -> bool {
     matches!(

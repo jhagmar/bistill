@@ -231,3 +231,156 @@ fn get_reports_tls_timeout_and_bad_ca() {
     request.timeout = Duration::from_secs(1);
     assert!(matches!(get(&request), Err(Error::Missing { .. })));
 }
+
+fn notify(expire: Option<Duration>) -> Toast {
+    Toast::NotifySend {
+        program: "true".to_owned(),
+        title: "Bistill".to_owned(),
+        body: "PRJ/repo#12 needs review".to_owned(),
+        expire,
+        timeout: Duration::from_secs(2),
+    }
+}
+
+fn powershell(url: Option<&str>) -> Toast {
+    Toast::PowerShell {
+        program: "true".to_owned(),
+        title: "Bistill".to_owned(),
+        body: "PRJ/repo#12 needs review".to_owned(),
+        url: url.map(str::to_owned),
+        timeout: Duration::from_secs(2),
+    }
+}
+
+fn strings(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn toast_and_open_arguments_match_the_contract() {
+    let notify_toast = Toast::NotifySend {
+        program: "notify-send".to_owned(),
+        title: "A&B<C>D\"E'F".to_owned(),
+        body: "-lead".to_owned(),
+        expire: Some(Duration::from_millis(1500)),
+        timeout: Duration::from_secs(2),
+    };
+    let notify_args = strings(&toast_arguments(&notify_toast));
+    assert_eq!(
+        notify_args,
+        vec!["--expire-time", "1500", "--", "A&B<C>D\"E'F", "-lead",]
+    );
+    assert!(
+        !notify_args
+            .iter()
+            .any(|arg| arg == "--action" || arg == "--wait")
+    );
+    assert!(format!("{notify_toast:?}").contains("NotifySend"));
+    let plain = strings(&toast_arguments(&notify(None)));
+    assert_eq!(plain, vec!["--", "Bistill", "PRJ/repo#12 needs review"]);
+
+    let powershell_toast = Toast::PowerShell {
+        program: "powershell.exe".to_owned(),
+        title: "A&B<C>D\"E'F".to_owned(),
+        body: "-lead".to_owned(),
+        url: Some("https://git.example.invalid/a?b=1&c=2".to_owned()),
+        timeout: Duration::from_secs(2),
+    };
+    let script = strings(&toast_arguments(&powershell_toast));
+    assert_eq!(&script[..3], ["-NoProfile", "-NonInteractive", "-Command"]);
+    let command = &script[3];
+    assert!(command.contains("activationType=\"protocol\""));
+    assert!(command.contains("launch=\"https://git.example.invalid/a?b=1&amp;c=2\""));
+    assert!(command.contains("<text>A&amp;B&lt;C&gt;D&quot;E&apos;F</text>"));
+    assert!(command.contains("<text>-lead</text>"));
+    assert!(command.contains(
+        "CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe')"
+    ));
+    assert!(format!("{powershell_toast:?}").contains("PowerShell"));
+
+    let no_click = strings(&toast_arguments(&powershell(None)));
+    assert!(!no_click[3].contains("activationType"));
+    assert!(no_click[3].contains("<text>Bistill</text>"));
+
+    let open = Open::XdgOpen {
+        program: "xdg-open".to_owned(),
+        url: "https://git.example.invalid/pr".to_owned(),
+        timeout: Duration::from_secs(2),
+    };
+    assert_eq!(
+        strings(&open_arguments(&open)),
+        vec!["https://git.example.invalid/pr"]
+    );
+    assert!(format!("{open:?}").contains("XdgOpen"));
+    let start = Open::WindowsStart {
+        program: "powershell.exe".to_owned(),
+        url: "https://git.example.invalid/it's".to_owned(),
+        timeout: Duration::from_secs(2),
+    };
+    assert_eq!(
+        strings(&open_arguments(&start)),
+        vec![
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Process -FilePath 'https://git.example.invalid/it''s' -Verb Open",
+        ]
+    );
+    assert!(format!("{start:?}").contains("WindowsStart"));
+}
+
+#[test]
+fn toast_and_open_report_spawn_results() {
+    assert!(toast(&notify(None)).is_ok());
+    assert!(toast(&powershell(Some("https://git.example.invalid/pr"))).is_ok());
+
+    let failed_toast = Toast::NotifySend {
+        program: "false".to_owned(),
+        title: "Bistill".to_owned(),
+        body: "PRJ/repo#12 needs review".to_owned(),
+        expire: None,
+        timeout: Duration::from_secs(2),
+    };
+    let failed = toast(&failed_toast).unwrap_err();
+    assert!(failed.to_string().contains("false exited 1"));
+    let missing_toast = Toast::NotifySend {
+        program: "bistill-host-missing-notify".to_owned(),
+        title: "Bistill".to_owned(),
+        body: "PRJ/repo#12 needs review".to_owned(),
+        expire: None,
+        timeout: Duration::from_secs(2),
+    };
+    assert!(matches!(toast(&missing_toast), Err(Error::Missing { .. })));
+
+    let open = Open::XdgOpen {
+        program: "true".to_owned(),
+        url: "https://git.example.invalid/pr".to_owned(),
+        timeout: Duration::from_secs(2),
+    };
+    assert!(open_url(&open).is_ok());
+    assert!(
+        open_url(&Open::WindowsStart {
+            program: "true".to_owned(),
+            url: "https://git.example.invalid/pr".to_owned(),
+            timeout: Duration::from_secs(2),
+        })
+        .is_ok()
+    );
+    let failed = open_url(&Open::WindowsStart {
+        program: "false".to_owned(),
+        url: "https://git.example.invalid/pr".to_owned(),
+        timeout: Duration::from_secs(2),
+    })
+    .unwrap_err();
+    assert!(matches!(failed, Error::Failed { .. }));
+    assert!(matches!(
+        open_url(&Open::XdgOpen {
+            program: "bistill-host-missing-open".to_owned(),
+            url: "https://git.example.invalid/pr".to_owned(),
+            timeout: Duration::from_secs(2),
+        }),
+        Err(Error::Missing { .. })
+    ));
+}

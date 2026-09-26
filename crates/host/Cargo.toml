@@ -1,6 +1,6 @@
 [package]
 name = "host"
-description = "Run a named program and HTTP GET through curl."
+description = "Run a named program, HTTP GET through curl, an OS toast, and open a URL."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
