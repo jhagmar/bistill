@@ -1,0 +1,10 @@
+[package]
+name = "json"
+description = "RFC 8259 JSON text."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
