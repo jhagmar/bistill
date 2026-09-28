@@ -102,7 +102,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// `program` is `curl` or `curl.exe`, or a path to that binary.
+    /// `program` is the curl executable on `PATH`.
     pub fn new(program: &str, config: &Config) -> Self {
         Self {
             program: program.to_owned(),
@@ -127,6 +127,15 @@ impl Client {
             ca_file: self.ca_file.clone(),
             fail_with_body: true,
         }
+    }
+
+    /// The origin probe and the three REST GETs, in call order.
+    pub fn requests(&self) -> Vec<host::Request> {
+        let (origin, product, user, inbox) = ping_paths(&self.username);
+        [origin, product, user, inbox]
+            .into_iter()
+            .map(|path| self.request(&path))
+            .collect()
     }
 }
 
@@ -156,13 +165,13 @@ pub fn ping(client: &Client) -> Result<Report, Error> {
 /// the sequence on a transport error or a status other than 200. The JSON `slug`
 /// is kept as the canonical user and must match `username` without regard to ASCII case.
 pub fn ping_with(client: &Client, fetch: &mut dyn Fetch) -> Result<Report, Error> {
-    call(client, fetch, "/")?;
-    let application = call_ok(client, fetch, "/rest/api/1.0/application-properties")?;
+    let (origin, product_path, user_path, inbox_path) = ping_paths(&client.username);
+    call(client, fetch, &origin)?;
+    let application = call_ok(client, fetch, &product_path)?;
     let product = parse_product(&application)?;
-    let user_path = format!("/rest/api/1.0/users/{}", encode_segment(&client.username));
     let user_body = call_ok(client, fetch, &user_path)?;
     let user = parse_user(&client.username, &user_body)?;
-    let inbox_body = call_ok(client, fetch, "/rest/api/1.0/inbox/pull-requests/count")?;
+    let inbox_body = call_ok(client, fetch, &inbox_path)?;
     let inbox = parse_inbox(&inbox_body)?;
     Ok(Report {
         product,
@@ -189,6 +198,15 @@ pub fn parse_user(username: &str, body: &[u8]) -> Result<User, Error> {
 /// Parse an inbox-count body.
 pub fn parse_inbox(body: &[u8]) -> Result<InboxCount, Error> {
     read_inbox(&json::parse(body)?)
+}
+
+fn ping_paths(username: &str) -> (String, String, String, String) {
+    (
+        "/".to_owned(),
+        "/rest/api/1.0/application-properties".to_owned(),
+        format!("/rest/api/1.0/users/{}", encode_segment(username)),
+        "/rest/api/1.0/inbox/pull-requests/count".to_owned(),
+    )
 }
 
 fn call(client: &Client, fetch: &mut dyn Fetch, path: &str) -> Result<host::Response, Error> {

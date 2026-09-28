@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "bistill"
+version = "0.1.0"
+dependencies = [
+ "bistill-lib",
+ "host",
+]
+
+[[package]]
 name = "bistill-lib"
 version = "0.1.0"
 dependencies = [

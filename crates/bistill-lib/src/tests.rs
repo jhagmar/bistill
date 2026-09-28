@@ -527,8 +527,11 @@ fn request_carries_bearer_agent_and_ca() {
     let debug = format!("{client:?}");
     assert!(debug.contains("***"));
     assert!(!debug.contains("secret-token"));
-    let bare = ping_client("https://git.example.invalid", "jcitizen");
+    let bare = ping_client("https://git.example.invalid", "a/b");
     assert!(bare.request("/").ca_file.is_none());
+    let planned = bare.requests();
+    assert_eq!(planned.len(), 4);
+    assert!(planned[2].url.ends_with("/users/a%2Fb"));
     relax(&dir);
     fs::remove_dir_all(&dir).unwrap();
 }
