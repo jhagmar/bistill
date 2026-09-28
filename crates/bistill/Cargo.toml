@@ -1,0 +1,12 @@
+[package]
+name = "bistill"
+description = "Read-only Bitbucket inbox."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bistill-lib = { path = "../bistill-lib" }
+host = { path = "../host" }

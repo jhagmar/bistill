@@ -10,6 +10,7 @@ mod config;
 mod ping;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
+pub use json::Error as JsonError;
 pub use ping::{
     Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
     parse_inbox, parse_product, parse_user, ping, ping_with,
