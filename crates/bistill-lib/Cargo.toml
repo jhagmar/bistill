@@ -1,6 +1,6 @@
 [package]
 name = "bistill-lib"
-description = "Config, errors, and the Bitbucket ping reads."
+description = "Config, errors, ping, and inbox classification."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

@@ -762,3 +762,266 @@ fn ping_through_curl_reads_a_local_server() {
     assert_eq!(report.inbox.to_string(), "reviewer 2, author 1");
     thread.join().expect("server");
 }
+
+const REVIEWER_PAGE: &str = include_str!("../../../fixtures/inbox-reviewer.json");
+const AUTHOR_PAGE: &str = include_str!("../../../fixtures/inbox-author.json");
+const NOW_MS: u64 = 1_700_000_000_000;
+
+#[test]
+fn inbox_fixtures_split_into_the_two_sections() {
+    let reviewer = parse_page(REVIEWER_PAGE.as_bytes()).unwrap();
+    let author = parse_page(AUTHOR_PAGE.as_bytes()).unwrap();
+    let _ = format!("{reviewer:?} {author:?}");
+    let _ = format!("{:?}", reviewer.values[3].state);
+    let _ = format!("{:?}", reviewer.values[4].state);
+    let _ = format!("{:?}", reviewer.values[5].reviewers[0].status);
+    assert_eq!(reviewer.size, 6);
+    assert!(matches!(
+        reviewer.end,
+        PageEnd::More {
+            next_page_start: 25
+        }
+    ));
+    assert!(matches!(author.end, PageEnd::Last));
+    let mut prs = reviewer.values;
+    prs.extend(author.values);
+    let sections = classify(&prs, "Jcitizen", "https://git.example.invalid", NOW_MS, 7);
+    let needs: Vec<_> = sections
+        .needs_review
+        .iter()
+        .map(|row| row.title.as_str())
+        .collect();
+    assert_eq!(
+        needs,
+        [
+            "Draft the pipe",
+            "Quiet draft",
+            "Fix the pipe",
+            "Both roles"
+        ]
+    );
+    assert!(
+        sections
+            .needs_review
+            .iter()
+            .all(|row| !row.stale && !row.needs_work)
+    );
+    assert!(sections.needs_review[0].draft);
+    assert_eq!(
+        sections.needs_review[0].html_url,
+        "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/13"
+    );
+    assert!(sections.needs_review[1].draft);
+    assert_eq!(
+        sections.needs_review[1].reviewers[0].status,
+        ReviewStatus::NeedsWork
+    );
+    assert!(!sections.needs_review[2].draft);
+    assert_eq!(
+        sections.needs_review[2].html_url,
+        "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/12"
+    );
+    let waiting: Vec<_> = sections.waiting.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(waiting, ["PRJ/pipe/21", "~jcitizen/mine/3"]);
+    assert!(sections.waiting[0].stale && sections.waiting[0].needs_work);
+    assert!(
+        !sections.waiting[1].stale && !sections.waiting[1].needs_work && !sections.waiting[1].draft
+    );
+    assert_eq!(
+        sections.waiting[1].html_url,
+        "https://git.example.invalid/projects/~jcitizen/repos/mine/pull-requests/3"
+    );
+    assert!(
+        sections
+            .needs_review
+            .iter()
+            .all(|row| row.id != "PRJ/repo/15")
+    );
+    assert!(
+        sections
+            .waiting
+            .iter()
+            .all(|row| row.title != "Already merged")
+    );
+    assert!(
+        sections
+            .needs_review
+            .iter()
+            .chain(sections.waiting.iter())
+            .all(|row| row.title != "Already declined" && row.title != "Already approved")
+    );
+    let _ = format!("{sections:?}");
+}
+
+#[test]
+fn classify_drops_duplicates_and_bounds_stale() {
+    let first = authored(9, "First", "repo", "PRJ", NOW_MS, r#""draft":false"#);
+    let second = authored(9, "Second", "repo", "PRJ", NOW_MS, r#""draft":false"#);
+    let page =
+        parse_page(page_body(&format!("{first},{second}"), "true", None).as_bytes()).unwrap();
+    let sections = classify(
+        &page.values,
+        "jcitizen",
+        "https://git.example.invalid",
+        NOW_MS,
+        7,
+    );
+    assert_eq!(sections.waiting.len(), 1);
+    assert_eq!(sections.waiting[0].title, "First");
+    let day = 86_400_000;
+    let exact = authored(
+        1,
+        "Exact",
+        "repo",
+        "PRJ",
+        NOW_MS - 7 * day,
+        r#""properties":{"draft":"false"}"#,
+    );
+    let just = authored(
+        2,
+        "Just",
+        "a/b",
+        "PRJ",
+        NOW_MS - 7 * day - 1,
+        r#""properties":{"draft":"true"}"#,
+    );
+    let page = parse_page(page_body(&format!("{exact},{just}"), "true", None).as_bytes()).unwrap();
+    let sections = classify(
+        &page.values,
+        "jcitizen",
+        "https://git.example.invalid",
+        NOW_MS,
+        7,
+    );
+    assert!(sections.waiting[0].stale && sections.waiting[0].draft);
+    assert!(!sections.waiting[1].stale && !sections.waiting[1].draft);
+    assert_eq!(
+        sections.waiting[0].html_url,
+        "https://git.example.invalid/projects/PRJ/repos/a%2Fb/pull-requests/2"
+    );
+}
+
+#[test]
+fn inbox_pages_reject_bad_shapes() {
+    assert!(parse_page(b"{").is_err());
+    let cases = vec![
+        (r#"{"isLastPage":true,"values":[]}"#.to_owned(), "missing size"),
+        (r#"{"size":1,"values":[]}"#.to_owned(), "missing isLastPage"),
+        (
+            r#"{"size":1,"isLastPage":false,"values":[]}"#.to_owned(),
+            "missing nextPageStart",
+        ),
+        (
+            r#"{"size":1,"isLastPage":"yes","values":[]}"#.to_owned(),
+            "isLastPage is not a boolean",
+        ),
+        (
+            r#"{"size":"1","isLastPage":true,"values":[]}"#.to_owned(),
+            "size is not an integer",
+        ),
+        (r#"{"size":0,"isLastPage":true}"#.to_owned(), "missing values"),
+        (
+            r#"{"size":0,"isLastPage":true,"values":{}}"#.to_owned(),
+            "values is not an array",
+        ),
+        (page_body(r#"{"id":1}"#, "true", None), "missing fromRef"),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""draft":false"#)
+                    .replace(r#""title":"T","#, ""),
+                "true",
+                None,
+            ),
+            "missing title",
+        ),
+        (
+            page_body(&authored(1, "T", "repo", "PRJ", 1, r#""draft":1"#), "true", None),
+            "draft is not a boolean",
+        ),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""properties":{"draft":"yes"}"#),
+                "true",
+                None,
+            ),
+            "draft is not a boolean",
+        ),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""properties":{"draft":1}"#),
+                "true",
+                None,
+            ),
+            "draft is not a boolean",
+        ),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""reviewers":{}"#),
+                "true",
+                None,
+            ),
+            "reviewers is not an array",
+        ),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""state":"CLOSED""#),
+                "true",
+                None,
+            ),
+            "unknown state",
+        ),
+        (
+            page_body(
+                &authored(1, "T", "repo", "PRJ", 1, r#""title":1"#).replace(r#""title":"T""#, r#""title":1"#),
+                "true",
+                None,
+            ),
+            "title is not a string",
+        ),
+        (
+            r#"{"size":1,"isLastPage":true,"values":[{"id":1,"title":"T","state":"OPEN","createdDate":1,"updatedDate":1,"fromRef":{"repository":{"slug":"repo","project":{"key":"PRJ"}}},"toRef":{"displayId":"main"},"author":{"user":{"displayName":"Pat","slug":"pat"}}}]}"#.to_owned(),
+            "missing displayId",
+        ),
+    ];
+    for (body, needle) in cases {
+        let err = parse_page(body.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err} / {needle}");
+    }
+    let weird = authored(
+        1,
+        "T",
+        "repo",
+        "PRJ",
+        1,
+        r#""reviewers":[{"user":{"displayName":"Sam","slug":"sam"},"status":"MAYBE"}]"#,
+    );
+    let err = parse_page(page_body(&weird, "true", None).as_bytes()).unwrap_err();
+    assert!(err.to_string().contains("unknown status"), "{err}");
+    let bare = authored(4, "Bare", "repo", "PRJ", 1, r#""properties":{}"#);
+    let page = parse_page(page_body(&bare, "true", None).as_bytes()).unwrap();
+    assert!(!page.values[0].draft);
+    let empty = parse_page(br#"{"size":0,"isLastPage":true,"values":[]}"#).unwrap();
+    let sections = classify(
+        &empty.values,
+        "jcitizen",
+        "https://git.example.invalid",
+        NOW_MS,
+        7,
+    );
+    assert!(sections.needs_review.is_empty() && sections.waiting.is_empty());
+    let _ = format!("{:?}", empty.end);
+}
+
+fn page_body(values: &str, last: &str, next: Option<u64>) -> String {
+    let next = match next {
+        Some(start) => format!(r#","nextPageStart":{start}"#),
+        None => String::new(),
+    };
+    format!(r#"{{"size":1,"isLastPage":{last}{next},"values":[{values}]}}"#)
+}
+
+fn authored(id: u64, title: &str, repo: &str, project: &str, updated: u64, extra: &str) -> String {
+    format!(
+        r#"{{"id":{id},"title":"{title}","state":"OPEN","createdDate":1,"updatedDate":{updated},"fromRef":{{"displayId":"feature","repository":{{"slug":"{repo}","project":{{"key":"{project}"}}}}}},"toRef":{{"displayId":"main"}},"author":{{"user":{{"displayName":"Jane Citizen","slug":"jcitizen"}}}},{extra}}}"#
+    )
+}

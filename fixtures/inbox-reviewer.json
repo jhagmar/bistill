@@ -1,0 +1,122 @@
+{
+  "size": 6,
+  "limit": 25,
+  "isLastPage": false,
+  "start": 0,
+  "nextPageStart": 25,
+  "values": [
+    {
+      "id": 12,
+      "title": "Fix the pipe",
+      "state": "OPEN",
+      "draft": false,
+      "createdDate": 1,
+      "updatedDate": 3000,
+      "fromRef": {
+        "displayId": "feature/x",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Draft the pipe",
+      "state": "OPEN",
+      "draft": true,
+      "createdDate": 1,
+      "updatedDate": 1000,
+      "fromRef": {
+        "displayId": "feature/draft",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+      ],
+      "links": {
+        "self": [
+          { "href": "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/13" }
+        ]
+      }
+    },
+    {
+      "id": 14,
+      "title": "Quiet draft",
+      "state": "OPEN",
+      "createdDate": 1,
+      "updatedDate": 2000,
+      "properties": { "draft": true },
+      "fromRef": {
+        "displayId": "feature/quiet",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "NEEDS_WORK" }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Already merged",
+      "state": "MERGED",
+      "createdDate": 1,
+      "updatedDate": 1,
+      "fromRef": {
+        "displayId": "feature/merged",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+      ],
+      "links": {
+        "self": [
+          { "rel": "skip" },
+          { "href": "https://git.example.invalid/projects/PRJ" },
+          { "href": "https://git.example.invalid/rest/api/1.0/projects/PRJ/repos/repo/pull-requests/15" }
+        ],
+        "watchers": {}
+      }
+    },
+    {
+      "id": 16,
+      "title": "Already declined",
+      "state": "DECLINED",
+      "createdDate": 1,
+      "updatedDate": 1,
+      "fromRef": {
+        "displayId": "feature/declined",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+      ],
+      "links": []
+    },
+    {
+      "id": 17,
+      "title": "Already approved",
+      "state": "OPEN",
+      "createdDate": 1,
+      "updatedDate": 1,
+      "fromRef": {
+        "displayId": "feature/ok",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Pat", "slug": "pat" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "APPROVED" }
+      ]
+    }
+  ]
+}

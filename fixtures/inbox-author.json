@@ -1,0 +1,53 @@
+{
+  "size": 3,
+  "limit": 25,
+  "isLastPage": true,
+  "start": 0,
+  "values": [
+    {
+      "id": 21,
+      "title": "Waiting on Sam",
+      "state": "OPEN",
+      "createdDate": 1,
+      "updatedDate": 1699308800000,
+      "fromRef": {
+        "displayId": "feature/wait",
+        "repository": { "slug": "pipe", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" } },
+      "reviewers": [
+        { "user": { "displayName": "Sam", "slug": "sam" }, "status": "NEEDS_WORK" }
+      ]
+    },
+    {
+      "id": 22,
+      "title": "Both roles",
+      "state": "OPEN",
+      "createdDate": 1,
+      "updatedDate": 4000,
+      "fromRef": {
+        "displayId": "feature/both",
+        "repository": { "slug": "repo", "project": { "key": "PRJ" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" } },
+      "reviewers": [
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Personal repo",
+      "state": "OPEN",
+      "createdDate": 1,
+      "updatedDate": 1699913600000,
+      "fromRef": {
+        "displayId": "feature/mine",
+        "repository": { "slug": "mine", "project": { "key": "~jcitizen" } }
+      },
+      "toRef": { "displayId": "main" },
+      "author": { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" } }
+    }
+  ]
+}

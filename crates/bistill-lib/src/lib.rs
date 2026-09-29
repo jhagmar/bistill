@@ -1,15 +1,20 @@
-//! Config, the process error type, and the Bitbucket reads `ping` performs.
+//! Config, the process error type, ping, and inbox classification.
 //!
 //! This crate owns `key = value` config, environment and flag overrides,
-//! [`Error`], and the application-properties, user, and inbox-count calls.
-//! It does not draw a terminal.
+//! [`Error`], the ping reads, and the split of an inbox page into Needs review
+//! and Waiting. It does not draw a terminal.
 
 #![deny(unsafe_code)]
 
 mod config;
+mod inbox;
 mod ping;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
+pub use inbox::{
+    InboxPage, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections, State, UserRef,
+    classify, parse_page,
+};
 pub use json::Error as JsonError;
 pub use ping::{
     Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
