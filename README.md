@@ -17,6 +17,16 @@ bodies. curl must be on PATH. The token is `BISTILL_TOKEN` or `token_file`.
 bistill ping --url https://git.example.invalid --user jcitizen
 ```
 
+## ls
+
+`bistill ls` prints Needs review and Waiting on others. An empty list prints
+"Nothing needs your attention." and exits 0. `--count` prints how many pull
+requests need you. `--json` prints the snapshot.
+
+```
+bistill ls --url https://git.example.invalid --user jcitizen
+```
+
 ## Build
 
 MSRV is 1.85. Edition 2024.

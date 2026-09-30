@@ -1,6 +1,6 @@
 [package]
 name = "bistill-lib"
-description = "Config, errors, ping, and inbox classification."
+description = "Config, errors, ping, inbox classification, and list snapshots."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

@@ -133,6 +133,12 @@ pub struct Row {
     pub stale: bool,
     /// Waiting row with a `NEEDS_WORK` reviewer.
     pub needs_work: bool,
+    /// Threads waiting on the author. List rows use 0 until enrichment.
+    pub unanswered_as_author: u64,
+    /// Threads waiting on this reviewer. List rows use 0 until enrichment.
+    pub unanswered_as_reviewer: u64,
+    /// Open blocker comments. List rows use 0 until enrichment.
+    pub open_tasks: u64,
 }
 
 /// The two sections, oldest update first.
@@ -254,6 +260,9 @@ fn row_from(pr: &PullRequest, base_url: &str, stale: bool, needs_work: bool) -> 
         draft: pr.draft,
         stale,
         needs_work,
+        unanswered_as_author: 0,
+        unanswered_as_reviewer: 0,
+        open_tasks: 0,
     }
 }
 
