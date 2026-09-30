@@ -87,6 +87,8 @@ pub struct Client {
     username: String,
     token: String,
     ca_file: Option<PathBuf>,
+    poll_seconds: u64,
+    stale_days: u32,
 }
 
 impl std::fmt::Debug for Client {
@@ -97,6 +99,8 @@ impl std::fmt::Debug for Client {
             .field("username", &self.username)
             .field("token", &"***")
             .field("ca_file", &self.ca_file)
+            .field("poll_seconds", &self.poll_seconds)
+            .field("stale_days", &self.stale_days)
             .finish()
     }
 }
@@ -110,7 +114,25 @@ impl Client {
             username: config.username.clone(),
             token: config.token().to_owned(),
             ca_file: config.ca_file.clone(),
+            poll_seconds: config.poll_seconds.get(),
+            stale_days: config.stale_days,
         }
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn poll_seconds(&self) -> u64 {
+        self.poll_seconds
+    }
+
+    pub(crate) fn stale_days(&self) -> u32 {
+        self.stale_days
     }
 
     /// GET `path` on `base_url`. `path` starts with `/`.
@@ -274,7 +296,7 @@ fn shape(message: &str) -> Error {
     })
 }
 
-fn encode_segment(text: &str) -> String {
+pub(crate) fn encode_segment(text: &str) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
         match byte {

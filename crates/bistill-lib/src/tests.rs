@@ -1020,6 +1020,149 @@ fn page_body(values: &str, last: &str, next: Option<u64>) -> String {
     format!(r#"{{"size":1,"isLastPage":{last}{next},"values":[{values}]}}"#)
 }
 
+const EMPTY_PAGE: &str = r#"{"size":0,"isLastPage":true,"values":[]}"#;
+
+fn run_list(
+    steps: Vec<Result<host::Response, host::Error>>,
+) -> (Result<Listed, Error>, Vec<String>) {
+    let client = ping_client("https://git.example.invalid", "jcitizen");
+    let mut queue = Queue {
+        steps,
+        urls: Vec::new(),
+    };
+    let result = list_inbox(&client, &mut queue, NOW_MS);
+    (result, queue.urls)
+}
+
+#[test]
+fn list_inbox_pages_both_roles_and_round_trips() {
+    let (listed, urls) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, REVIEWER_PAGE),
+        step(200, EMPTY_PAGE),
+        step(200, AUTHOR_PAGE),
+    ]);
+    let mut listed = listed.unwrap();
+    assert!(urls[2].contains("role=REVIEWER&start=0&limit=25"));
+    assert!(urls[3].contains("role=REVIEWER&start=25&limit=25"));
+    assert!(urls[4].contains("role=AUTHOR&start=0&limit=25"));
+    let needs: Vec<_> = listed
+        .snapshot
+        .needs_review
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(
+        needs,
+        ["PRJ/repo/13", "PRJ/repo/14", "PRJ/repo/12", "PRJ/repo/22"]
+    );
+    let waiting: Vec<_> = listed
+        .snapshot
+        .waiting
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(waiting, ["PRJ/pipe/21", "~jcitizen/mine/3"]);
+    assert_eq!(listed.snapshot.truncated, 0);
+    assert_eq!(listed.snapshot.poll_seconds, 60);
+    assert_eq!(listed.snapshot.user_name, "Jane Citizen");
+    assert_eq!(listed.snapshot.bitbucket_version, "8.19.0");
+    assert_eq!(attention_count(&listed.snapshot), 4);
+    listed.snapshot.needs_review[0].open_tasks = 9;
+    assert_eq!(attention_count(&listed.snapshot), 4);
+    listed.snapshot.waiting[0].open_tasks = 1;
+    assert_eq!(attention_count(&listed.snapshot), 5);
+    listed.snapshot.waiting[0].open_tasks = 0;
+    listed.snapshot.waiting[0].unanswered_as_author = 2;
+    assert_eq!(attention_count(&listed.snapshot), 5);
+    let text = to_json(&listed.snapshot);
+    let parsed = json::parse(text.as_bytes()).unwrap();
+    assert_eq!(json::to_vec(&parsed), text.as_bytes());
+    assert!(text.contains("\"enrichment\":\"ready\""));
+    assert!(text.contains("\"build\":\"none\""));
+    assert!(!text.contains("fingerprint"));
+    let _ = format!("{:?}", listed.snapshot);
+}
+
+#[test]
+fn list_inbox_retries_lowercase_and_records_the_cap() {
+    let (empty, urls) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(400, "no"),
+        step(200, EMPTY_PAGE),
+        step(200, EMPTY_PAGE),
+    ]);
+    let empty = empty.unwrap();
+    assert!(urls[2].contains("role=REVIEWER"));
+    assert!(urls[3].contains("role=reviewer"));
+    assert!(empty.snapshot.needs_review.is_empty());
+    assert!(empty.snapshot.waiting.is_empty());
+    assert_eq!(attention_count(&empty.snapshot), 0);
+    let (again, _) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(400, "no"),
+        step(400, "no"),
+    ]);
+    assert!(matches!(again, Err(Error::Http(400))));
+    let stuck = r#"{"size":0,"isLastPage":false,"nextPageStart":0,"values":[]}"#;
+    let (stalled, _) = run_list(vec![step(200, APP), step(200, USER_JSON), step(200, stuck)]);
+    let Err(stalled) = stalled else {
+        panic!("expected nextPageStart");
+    };
+    assert!(stalled.to_string().contains("nextPageStart"));
+    let mut values = Vec::new();
+    for id in 1..=51 {
+        values.push(format!(
+            r#"{{"id":{id},"title":"T{id}","state":"OPEN","createdDate":1,"updatedDate":{id},"fromRef":{{"displayId":"f","repository":{{"slug":"repo","project":{{"key":"PRJ"}}}}}},"toRef":{{"displayId":"main"}},"author":{{"user":{{"displayName":"Pat","slug":"pat"}}}},"reviewers":[{{"user":{{"displayName":"Jane Citizen","slug":"jcitizen"}},"status":"UNAPPROVED"}}]}}"#
+        ));
+    }
+    let page = format!(
+        r#"{{"size":51,"isLastPage":true,"values":[{}]}}"#,
+        values.join(",")
+    );
+    let (capped, _) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, &page),
+        step(200, EMPTY_PAGE),
+    ]);
+    let capped = capped.unwrap();
+    assert_eq!(capped.snapshot.needs_review.len(), 51);
+    assert_eq!(capped.snapshot.truncated, 1);
+    assert!(capped.snapshot.waiting.is_empty());
+}
+
+#[test]
+fn list_inbox_stops_on_the_failing_get() {
+    let (timeout, _) = run_list(vec![Err(host::Error::Timeout {
+        program: "curl".to_owned(),
+    })]);
+    assert!(matches!(
+        timeout,
+        Err(Error::Curl(CurlFault::Timeout { .. }))
+    ));
+    let (denied, _) = run_list(vec![step(401, "no")]);
+    assert!(matches!(denied, Err(Error::Http(401))));
+    let (bad_product, _) = run_list(vec![step(200, "{")]);
+    assert!(matches!(bad_product, Err(Error::Json(_))));
+    let (bad_user, _) = run_list(vec![step(200, APP), step(200, "{")]);
+    assert!(matches!(bad_user, Err(Error::Json(_))));
+    let (user_http, _) = run_list(vec![step(200, APP), step(404, "no")]);
+    assert!(matches!(user_http, Err(Error::Http(404))));
+    let (bad_page, _) = run_list(vec![step(200, APP), step(200, USER_JSON), step(200, "{")]);
+    assert!(matches!(bad_page, Err(Error::Json(_))));
+    let (author_http, _) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, EMPTY_PAGE),
+        step(500, "no"),
+    ]);
+    assert!(matches!(author_http, Err(Error::Http(500))));
+}
+
 fn authored(id: u64, title: &str, repo: &str, project: &str, updated: u64, extra: &str) -> String {
     format!(
         r#"{{"id":{id},"title":"{title}","state":"OPEN","createdDate":1,"updatedDate":{updated},"fromRef":{{"displayId":"feature","repository":{{"slug":"{repo}","project":{{"key":"{project}"}}}}}},"toRef":{{"displayId":"main"}},"author":{{"user":{{"displayName":"Jane Citizen","slug":"jcitizen"}}}},{extra}}}"#

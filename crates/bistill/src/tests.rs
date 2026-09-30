@@ -61,6 +61,7 @@ fn report() -> Report {
 struct Script {
     version: Option<Result<String, Error>>,
     report: Option<Result<Report, Error>>,
+    listed: Option<Result<Listed, Error>>,
     origin: String,
 }
 
@@ -73,6 +74,12 @@ impl Session for Script {
     fn ping(&mut self, client: &Client) -> Result<Report, Error> {
         self.origin = client.requests()[0].url.clone();
         self.report.take().expect("ping")
+    }
+
+    fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error> {
+        let _ = now_ms;
+        self.origin = client.requests()[0].url.clone();
+        self.listed.take().expect("list")
     }
 }
 
@@ -100,6 +107,7 @@ fn ready(report: Result<Report, Error>) -> Script {
     Script {
         version: Some(Ok("curl 8.5.0".to_owned())),
         report: Some(report),
+        listed: None,
         origin: String::new(),
     }
 }
@@ -110,8 +118,11 @@ fn help_lists_ping_options() {
     let (code, stdout, stderr, _) = run(&["--help"], &cwd, &env_token(), ready(Ok(report())));
     assert_eq!(code, 0);
     assert!(stdout.contains("bistill ping"));
+    assert!(stdout.contains("bistill ls"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--count"));
     assert!(stdout.contains("--verbose"));
+    assert!(!stdout.contains("watch"));
     assert!(!stdout.contains("The Bitbucket list you were missing."));
     assert!(stderr.is_empty());
     let (again, text, _, _) = run(&["-h"], &cwd, &env_token(), ready(Ok(report())));
@@ -135,10 +146,12 @@ fn usage_names_the_next_step() {
     let (code, stdout, stderr, _) = run(&[], &cwd, &env, ready(Ok(report())));
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("Run ping."));
+    assert!(stderr.contains("Run ping or ls."));
     assert!(stderr.contains("Usage: bistill ping"));
-    let (_, _, unknown, _) = run(&["ls"], &cwd, &env, ready(Ok(report())));
+    let (_, _, unknown, _) = run(&["watch"], &cwd, &env, ready(Ok(report())));
     assert!(unknown.contains("Unknown argument."));
+    let (_, _, counted, _) = run(&["ping", "--count"], &cwd, &env, ready(Ok(report())));
+    assert!(counted.contains("Unknown argument."));
     let (_, _, missing, _) = run(&["ping", "--url"], &cwd, &env, ready(Ok(report())));
     assert!(missing.contains("--url needs a value."));
     let (_, _, dashed, _) = run(
@@ -369,6 +382,7 @@ fn ready_version(err: Result<String, Error>) -> Script {
     Script {
         version: Some(err),
         report: None,
+        listed: None,
         origin: String::new(),
     }
 }
@@ -521,6 +535,217 @@ fn ping_through_curl_reads_a_local_server() {
     assert!(text.contains('\n'));
     assert!(text.lines().next().unwrap().starts_with("curl "));
     assert!(text.ends_with("3\n"));
+    thread.join().expect("server");
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+fn listed_script(listed: Result<Listed, Error>) -> Script {
+    Script {
+        version: None,
+        report: None,
+        listed: Some(listed),
+        origin: String::new(),
+    }
+}
+
+fn sample_row(
+    project: &str,
+    repo: &str,
+    number: u64,
+    title: &str,
+    draft: bool,
+    stale: bool,
+    needs_work: bool,
+) -> Row {
+    Row {
+        id: format!("{project}/{repo}/{number}"),
+        project: project.to_owned(),
+        repo: repo.to_owned(),
+        number,
+        title: title.to_owned(),
+        author: "Pat".to_owned(),
+        from_branch: "feature".to_owned(),
+        to_branch: "main".to_owned(),
+        reviewers: Vec::new(),
+        created_ms: 1,
+        updated_ms: 1,
+        html_url: format!("https://git.example.invalid/pull/{number}"),
+        draft,
+        stale,
+        needs_work,
+        unanswered_as_author: 0,
+        unanswered_as_reviewer: 0,
+        open_tasks: 0,
+    }
+}
+
+fn sample_snapshot(needs_review: Vec<Row>, waiting: Vec<Row>) -> Snapshot {
+    Snapshot {
+        fetched_ms: 1,
+        user_slug: "jcitizen".to_owned(),
+        user_name: "Jane Citizen".to_owned(),
+        bitbucket_version: "8.19.0".to_owned(),
+        bitbucket_name: "Bitbucket".to_owned(),
+        truncated: 0,
+        poll_seconds: 60,
+        needs_review,
+        waiting,
+    }
+}
+
+#[test]
+fn ls_prints_sections_count_and_json() {
+    let cwd = temp("ls");
+    let env = env_token();
+    let snapshot = || {
+        sample_snapshot(
+            vec![
+                sample_row("PRJ", "repo", 13, "Draft the pipe", true, false, false),
+                sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false),
+            ],
+            vec![
+                sample_row("PRJ", "pipe", 21, "Waiting on Sam", false, true, true),
+                sample_row("~jcitizen", "mine", 3, "Personal repo", false, false, false),
+            ],
+        )
+    };
+    let (code, stdout, stderr, _) = run(
+        &["ls"],
+        &cwd,
+        &env,
+        listed_script(Ok(Listed {
+            snapshot: snapshot(),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(code, 0);
+    assert!(stderr.is_empty());
+    assert!(stdout.contains("Needs review\n"));
+    assert!(stdout.contains("Waiting on others\n"));
+    assert!(stdout.contains("PRJ/repo#13  Draft the pipe  draft\n"));
+    assert!(stdout.contains("PRJ/repo#12  Fix the pipe\n"));
+    assert!(stdout.contains("PRJ/pipe#21  Waiting on Sam  stale  needs work\n"));
+    assert!(stdout.contains("~jcitizen/mine#3  Personal repo\n"));
+    let (count_code, count, _, _) = run(
+        &["ls", "--count", "--json"],
+        &cwd,
+        &env,
+        listed_script(Ok(Listed {
+            snapshot: snapshot(),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(count_code, 0);
+    assert_eq!(count, "2\n");
+    let (json_code, json, _, _) = run(
+        &["ls", "--json"],
+        &cwd,
+        &env,
+        listed_script(Ok(Listed {
+            snapshot: snapshot(),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(json_code, 0);
+    assert!(json.contains("\"id\":\"PRJ/repo/13\""));
+    assert!(json.ends_with('\n'));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn ls_empty_is_success_and_verbose_redacts() {
+    let cwd = temp("ls-empty");
+    let env = env_token();
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
+    let client = Client::new(curl_bin::PROGRAM, &config);
+    let request =
+        client.request("/rest/api/1.0/inbox/pull-requests?role=REVIEWER&start=0&limit=25");
+    let (code, stdout, stderr, _) = run(
+        &["ls", "--verbose"],
+        &cwd,
+        &env,
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: vec![request],
+        })),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "Nothing needs your attention.\n");
+    assert!(stderr.contains("Bearer ***"));
+    assert!(!stderr.contains("secret-token"));
+    let (missing, _, err, _) = run(
+        &["ls"],
+        &cwd,
+        &Env::new(),
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(missing, 1);
+    assert!(err.contains("base_url"));
+    let (rejected, out, token, _) = run(&["ls"], &cwd, &env, listed_script(Err(Error::Http(401))));
+    assert_eq!(rejected, 11);
+    assert!(out.is_empty());
+    assert!(token.contains("Token rejected."));
+    let (url_code, _, _, origin) = run(
+        &["ls", "--url", "https://ls.example.invalid"],
+        &cwd,
+        &env,
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(url_code, 0);
+    assert!(origin.starts_with("https://ls.example.invalid"));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn unix_ms_is_zero_before_the_epoch() {
+    assert_eq!(unix_ms(std::time::SystemTime::UNIX_EPOCH), 0);
+    let before = std::time::SystemTime::UNIX_EPOCH
+        .checked_sub(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(unix_ms(before), 0);
+}
+
+#[test]
+fn live_list_reads_http_status() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let thread = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let head = "HTTP/1.1 500 ERR\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(b"no");
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let cwd = temp("live-list");
+    let mut env = env_token();
+    env.base_url = Some(format!("http://127.0.0.1:{port}"));
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
+    let client = Client::new(curl_bin::PROGRAM, &config);
+    let err = match Live.list(&client, 0) {
+        Err(err) => err,
+        Ok(_) => panic!("expected HTTP 500"),
+    };
+    assert!(matches!(err, Error::Http(500)), "{err}");
     thread.join().expect("server");
     fs::remove_dir_all(&cwd).unwrap();
 }

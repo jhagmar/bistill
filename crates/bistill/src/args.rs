@@ -1,4 +1,4 @@
-//! Hand-rolled argv for `bistill ping`.
+//! Hand-rolled argv for `bistill ping` and `bistill ls`.
 
 use bistill_lib::Flags;
 use std::ffi::OsString;
@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "\
 Usage: bistill ping [--json] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
+       bistill ls [--json] [--count] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
 ";
 
 /// What to run.
@@ -14,6 +15,8 @@ pub(crate) enum Command {
     Help,
     /// `ping`.
     Ping(Ping),
+    /// `ls`.
+    Ls(Ls),
 }
 
 /// Flags for `ping`.
@@ -25,6 +28,24 @@ pub(crate) struct Ping {
     pub verbose: bool,
     /// Config overrides.
     pub flags: Flags,
+}
+
+/// Flags for `ls`.
+#[derive(Default)]
+pub(crate) struct Ls {
+    /// `--json`.
+    pub json: bool,
+    /// `--count`.
+    pub count: bool,
+    /// `--verbose`.
+    pub verbose: bool,
+    /// Config overrides.
+    pub flags: Flags,
+}
+
+enum Kind {
+    Ping,
+    Ls,
 }
 
 /// Why argv was rejected.
@@ -47,30 +68,48 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
     if first == "--help" || first == "-h" {
         return Ok(Command::Help);
     }
-    if first != "ping" {
+    let kind = if first == "ping" {
+        Kind::Ping
+    } else if first == "ls" {
+        Kind::Ls
+    } else {
         return Err(Usage::Unknown);
-    }
-    let mut ping = Ping::default();
+    };
+    let mut json = false;
+    let mut count = false;
+    let mut verbose = false;
+    let mut flags = Flags::default();
     while let Some(arg) = iter.next() {
         if arg == "--help" || arg == "-h" {
             return Ok(Command::Help);
         }
         let name = arg.to_str().ok_or(Usage::NotUtf8)?;
         match name {
-            "--json" => ping.json = true,
-            "--verbose" => ping.verbose = true,
-            "--url" => ping.flags.base_url = Some(value(&mut iter, "--url")?),
-            "--user" => ping.flags.username = Some(value(&mut iter, "--user")?),
+            "--json" => json = true,
+            "--count" if matches!(kind, Kind::Ls) => count = true,
+            "--verbose" => verbose = true,
+            "--url" => flags.base_url = Some(value(&mut iter, "--url")?),
+            "--user" => flags.username = Some(value(&mut iter, "--user")?),
             "--token-file" => {
-                ping.flags.token_file = Some(PathBuf::from(value(&mut iter, "--token-file")?));
+                flags.token_file = Some(PathBuf::from(value(&mut iter, "--token-file")?));
             }
-            "--config" => {
-                ping.flags.config = Some(PathBuf::from(value(&mut iter, "--config")?));
-            }
+            "--config" => flags.config = Some(PathBuf::from(value(&mut iter, "--config")?)),
             _ => return Err(Usage::Unknown),
         }
     }
-    Ok(Command::Ping(ping))
+    match kind {
+        Kind::Ping => Ok(Command::Ping(Ping {
+            json,
+            verbose,
+            flags,
+        })),
+        Kind::Ls => Ok(Command::Ls(Ls {
+            json,
+            count,
+            verbose,
+            flags,
+        })),
+    }
 }
 
 fn value<'a>(
@@ -91,7 +130,8 @@ pub(crate) fn help_text() -> String {
     format!(
         "\
 {USAGE}\
---json prints the raw response bodies.
+--json prints the raw bodies for ping, and the snapshot for ls.
+--count prints how many pull requests need you.
 --url sets the Bitbucket origin.
 --user sets the username.
 --token-file sets the token file.
@@ -104,7 +144,7 @@ pub(crate) fn help_text() -> String {
 
 pub(crate) fn usage_text(usage: &Usage) -> String {
     let reason = match usage {
-        Usage::Bare => "Run ping.".to_owned(),
+        Usage::Bare => "Run ping or ls.".to_owned(),
         Usage::Unknown => "Unknown argument.".to_owned(),
         Usage::NeedsValue(flag) => format!("{flag} needs a value."),
         Usage::NotUtf8 => "The argument must be UTF-8.".to_owned(),

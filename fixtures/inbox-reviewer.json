@@ -19,7 +19,8 @@
       "toRef": { "displayId": "main" },
       "author": { "user": { "displayName": "Pat", "slug": "pat" } },
       "reviewers": [
-        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" }
+        { "user": { "displayName": "Jane Citizen", "slug": "jcitizen" }, "status": "UNAPPROVED" },
+        { "user": { "displayName": "Sam", "slug": "sam" }, "status": "APPROVED" }
       ]
     },
     {
