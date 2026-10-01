@@ -5,9 +5,31 @@
 //! The snapshot is list-only: enrichment counts stay 0, `build` is `none`.
 
 use crate::Error;
-use crate::inbox::{PageEnd, ReviewStatus, Reviewer, Row, Sections, classify, parse_page};
+use crate::fingerprint;
+use crate::inbox::{
+    Build, Enrichment, PageEnd, ReviewStatus, Reviewer, Row, Sections, classify, parse_page,
+};
 use crate::ping::{Client, Fetch, encode_segment, parse_product, parse_user};
 use json::Value;
+
+/// `status` on a snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotStatus {
+    /// A fetch is in flight.
+    Fetching,
+    /// The list was applied.
+    Ok,
+    /// Bitbucket could not be reached.
+    Unreachable,
+    /// The token was rejected.
+    Auth,
+    /// TLS failed.
+    Tls,
+    /// HTTP 429.
+    RateLimited,
+    /// Another poll failure.
+    Error,
+}
 
 /// How many OPEN rows stay list-only after the first 50.
 pub const ENRICH_CAP: usize = 50;
@@ -25,6 +47,10 @@ pub struct Snapshot {
     pub bitbucket_version: String,
     /// Bitbucket `displayName`.
     pub bitbucket_name: String,
+    /// Poll status. `ls` writes [`SnapshotStatus::Ok`].
+    pub status: SnapshotStatus,
+    /// When `status` last changed, epoch milliseconds.
+    pub status_since_ms: u64,
     /// Needs review, oldest update first.
     pub needs_review: Vec<Row>,
     /// Waiting, oldest update first.
@@ -65,20 +91,24 @@ pub fn list_inbox(client: &Client, fetch: &mut dyn Fetch, now_ms: u64) -> Result
         now_ms,
         client.stale_days(),
     );
-    Ok(Listed {
+    let mut listed = Listed {
         snapshot: Snapshot {
             fetched_ms: now_ms,
             user_slug: user.slug,
             user_name: user.display_name,
             bitbucket_version: product.version,
             bitbucket_name: product.display_name,
+            status: SnapshotStatus::Ok,
+            status_since_ms: now_ms,
             truncated: truncated(&sections),
             poll_seconds: client.poll_seconds(),
             needs_review: sections.needs_review,
             waiting: sections.waiting,
         },
         requests,
-    })
+    };
+    fingerprint::stamp(&mut listed.snapshot);
+    Ok(listed)
 }
 
 /// Needs review, plus Waiting rows whose author-thread or task count is above 0.
@@ -177,8 +207,8 @@ fn snapshot_value(snapshot: &Snapshot) -> Value {
                 ("display_name", string(&snapshot.bitbucket_name)),
             ]),
         ),
-        ("status", string("ok")),
-        ("status_since_ms", number(snapshot.fetched_ms)),
+        ("status", string(status_text(snapshot.status))),
+        ("status_since_ms", number(snapshot.status_since_ms)),
         ("needs_review", rows(&snapshot.needs_review)),
         ("waiting", rows(&snapshot.waiting)),
         ("truncated", number(snapshot.truncated)),
@@ -191,7 +221,7 @@ fn rows(rows: &[Row]) -> Value {
 }
 
 fn row_value(row: &Row) -> Value {
-    object(vec![
+    let mut pairs = vec![
         ("id", string(&row.id)),
         ("project", string(&row.project)),
         ("repo", string(&row.repo)),
@@ -208,27 +238,61 @@ fn row_value(row: &Row) -> Value {
         ("updated_ms", number(row.updated_ms)),
         ("html_url", string(&row.html_url)),
         ("draft", boolean(row.draft)),
-        ("enrichment", string("ready")),
+        ("enrichment", string(enrichment_text(row.enrichment))),
         ("stale", boolean(row.stale)),
         ("needs_work", boolean(row.needs_work)),
-        ("unanswered_as_author", number(row.unanswered_as_author)),
-        ("unanswered_as_reviewer", number(row.unanswered_as_reviewer)),
-        ("open_tasks", number(row.open_tasks)),
-        ("build", string("none")),
-        ("conflicted", boolean(false)),
-        ("can_merge", boolean(false)),
-    ])
+    ];
+    if row.enrichment == Enrichment::Ready {
+        pairs.extend([
+            ("unanswered_as_author", number(row.unanswered_as_author)),
+            ("unanswered_as_reviewer", number(row.unanswered_as_reviewer)),
+            ("open_tasks", number(row.open_tasks)),
+            ("build", string(build_text(row.build))),
+            ("conflicted", boolean(row.conflicted)),
+            ("can_merge", boolean(row.can_merge)),
+        ]);
+    }
+    pairs.push(("fingerprint", string(&row.fingerprint)));
+    object(pairs)
+}
+
+fn status_text(status: SnapshotStatus) -> &'static str {
+    match status {
+        SnapshotStatus::Fetching => "fetching",
+        SnapshotStatus::Ok => "ok",
+        SnapshotStatus::Unreachable => "unreachable",
+        SnapshotStatus::Auth => "auth",
+        SnapshotStatus::Tls => "tls",
+        SnapshotStatus::RateLimited => "rate_limited",
+        SnapshotStatus::Error => "error",
+    }
+}
+
+fn enrichment_text(enrichment: Enrichment) -> &'static str {
+    match enrichment {
+        Enrichment::Ready => "ready",
+        Enrichment::Pending => "pending",
+    }
+}
+
+fn build_text(build: Build) -> &'static str {
+    match build {
+        Build::None => "none",
+        Build::Successful => "successful",
+        Build::InProgress => "in_progress",
+        Build::Failed => "failed",
+    }
 }
 
 fn reviewer_value(reviewer: &Reviewer) -> Value {
     object(vec![
         ("name", string(&reviewer.name)),
         ("slug", string(&reviewer.slug)),
-        ("status", string(status_text(reviewer.status))),
+        ("status", string(review_text(reviewer.status))),
     ])
 }
 
-fn status_text(status: ReviewStatus) -> &'static str {
+fn review_text(status: ReviewStatus) -> &'static str {
     match status {
         ReviewStatus::Unapproved => "UNAPPROVED",
         ReviewStatus::NeedsWork => "NEEDS_WORK",

@@ -7,17 +7,23 @@
 #![deny(unsafe_code)]
 
 mod config;
+mod fingerprint;
 mod inbox;
 mod list;
 mod ping;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
+pub use fingerprint::{
+    Change, Reason, Section, diff, parse_snapshot, read_snapshot, stamp, write_snapshot,
+};
 pub use inbox::{
-    InboxPage, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections, State, UserRef,
-    classify, parse_page,
+    Build, Enrichment, InboxPage, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections,
+    State, UserRef, classify, parse_page,
 };
 pub use json::Error as JsonError;
-pub use list::{ENRICH_CAP, Listed, Snapshot, attention_count, list_inbox, to_json};
+pub use list::{
+    ENRICH_CAP, Listed, Snapshot, SnapshotStatus, attention_count, list_inbox, to_json,
+};
 pub use ping::{
     Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
     parse_inbox, parse_product, parse_user, ping, ping_with,
