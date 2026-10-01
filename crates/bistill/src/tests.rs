@@ -30,7 +30,7 @@ fn temp(name: &str) -> PathBuf {
     fs::create_dir_all(&path).unwrap();
     fs::write(
         path.join("bistill.conf"),
-        "state_dir = /tmp/bistill-state\n",
+        format!("state_dir = {}\n", path.display()),
     )
     .unwrap();
     path
@@ -576,21 +576,30 @@ fn sample_row(
         unanswered_as_author: 0,
         unanswered_as_reviewer: 0,
         open_tasks: 0,
+        enrichment: bistill_lib::Enrichment::Ready,
+        build: bistill_lib::Build::None,
+        conflicted: false,
+        can_merge: false,
+        fingerprint: String::new(),
     }
 }
 
 fn sample_snapshot(needs_review: Vec<Row>, waiting: Vec<Row>) -> Snapshot {
-    Snapshot {
+    let mut snapshot = Snapshot {
         fetched_ms: 1,
         user_slug: "jcitizen".to_owned(),
         user_name: "Jane Citizen".to_owned(),
         bitbucket_version: "8.19.0".to_owned(),
         bitbucket_name: "Bitbucket".to_owned(),
+        status: bistill_lib::SnapshotStatus::Ok,
+        status_since_ms: 1,
         truncated: 0,
         poll_seconds: 60,
         needs_review,
         waiting,
-    }
+    };
+    bistill_lib::stamp(&mut snapshot);
+    snapshot
 }
 
 #[test]
@@ -649,6 +658,34 @@ fn ls_prints_sections_count_and_json() {
     assert_eq!(json_code, 0);
     assert!(json.contains("\"id\":\"PRJ/repo/13\""));
     assert!(json.ends_with('\n'));
+    let disk = fs::read_to_string(cwd.join("snapshot.json")).unwrap();
+    assert!(disk.contains("PRJ/repo/13"));
+    assert!(disk.contains("fingerprint"));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn ls_refuses_a_file_as_state_dir() {
+    let cwd = temp("ls-file-state");
+    let file = cwd.join("not-dir");
+    fs::write(&file, "x").unwrap();
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!("state_dir = {}\n", file.display()),
+    )
+    .unwrap();
+    let (code, stdout, stderr, _) = run(
+        &["ls"],
+        &cwd,
+        &env_token(),
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stdout.is_empty());
+    assert!(!stderr.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 

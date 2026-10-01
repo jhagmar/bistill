@@ -1081,7 +1081,7 @@ fn list_inbox_pages_both_roles_and_round_trips() {
     assert_eq!(json::to_vec(&parsed), text.as_bytes());
     assert!(text.contains("\"enrichment\":\"ready\""));
     assert!(text.contains("\"build\":\"none\""));
-    assert!(!text.contains("fingerprint"));
+    assert!(text.contains("\"fingerprint\":\""));
     let _ = format!("{:?}", listed.snapshot);
 }
 
@@ -1167,4 +1167,587 @@ fn authored(id: u64, title: &str, repo: &str, project: &str, updated: u64, extra
     format!(
         r#"{{"id":{id},"title":"{title}","state":"OPEN","createdDate":1,"updatedDate":{updated},"fromRef":{{"displayId":"feature","repository":{{"slug":"{repo}","project":{{"key":"{project}"}}}}}},"toRef":{{"displayId":"main"}},"author":{{"user":{{"displayName":"Jane Citizen","slug":"jcitizen"}}}},{extra}}}"#
     )
+}
+
+fn person(slug: &str, status: ReviewStatus) -> Reviewer {
+    Reviewer {
+        name: slug.to_owned(),
+        slug: slug.to_owned(),
+        status,
+    }
+}
+
+fn finger_row(id: &str, updated: u64, reviewers: Vec<Reviewer>) -> Row {
+    Row {
+        id: id.to_owned(),
+        project: "PRJ".to_owned(),
+        repo: "repo".to_owned(),
+        number: 1,
+        title: "T".to_owned(),
+        author: "Pat".to_owned(),
+        from_branch: "feature".to_owned(),
+        to_branch: "main".to_owned(),
+        reviewers,
+        created_ms: 1,
+        updated_ms: updated,
+        html_url: "https://git.example.invalid/pull/1".to_owned(),
+        draft: false,
+        stale: false,
+        needs_work: false,
+        unanswered_as_author: 0,
+        unanswered_as_reviewer: 0,
+        open_tasks: 0,
+        enrichment: Enrichment::Ready,
+        build: Build::None,
+        conflicted: false,
+        can_merge: false,
+        fingerprint: String::new(),
+    }
+}
+
+fn finger_snapshot(slug: &str, needs_review: Vec<Row>, waiting: Vec<Row>) -> Snapshot {
+    let mut snapshot = Snapshot {
+        fetched_ms: 1,
+        user_slug: slug.to_owned(),
+        user_name: "Jane Citizen".to_owned(),
+        bitbucket_version: "8.19.0".to_owned(),
+        bitbucket_name: "Bitbucket".to_owned(),
+        status: SnapshotStatus::Ok,
+        status_since_ms: 1,
+        needs_review,
+        waiting,
+        truncated: 0,
+        poll_seconds: 60,
+    };
+    stamp(&mut snapshot);
+    snapshot
+}
+
+fn change_tokens(changes: &[Change]) -> Vec<(String, Vec<&str>)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.id.clone(),
+                change.reasons.iter().map(|reason| reason.token()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn fingerprint_diff_and_snapshot_file() {
+    let pending = finger_row(
+        "PRJ/repo/5",
+        5,
+        vec![person("jcitizen", ReviewStatus::Approved)],
+    );
+    let mut pending = finger_snapshot("jcitizen", Vec::new(), vec![pending]);
+    pending.waiting[0].enrichment = Enrichment::Pending;
+    stamp(&mut pending);
+    assert_eq!(
+        pending.waiting[0].fingerprint,
+        "350a77616974696e670a415050524f5645440a6a636974697a656e20415050524f5645440a"
+    );
+    let mut folded = finger_snapshot(
+        "Jcitizen",
+        Vec::new(),
+        vec![finger_row(
+            "PRJ/repo/5",
+            5,
+            vec![person("jcitizen", ReviewStatus::Approved)],
+        )],
+    );
+    folded.waiting[0].enrichment = Enrichment::Pending;
+    stamp(&mut folded);
+    assert_eq!(
+        folded.waiting[0].fingerprint,
+        pending.waiting[0].fingerprint
+    );
+    let text = to_json(&pending);
+    assert!(!text.contains("unanswered_as_author"));
+    let loaded = parse_snapshot(text.as_bytes()).unwrap();
+    assert_eq!(loaded.waiting[0].enrichment, Enrichment::Pending);
+    assert_eq!(loaded.waiting[0].open_tasks, 0);
+
+    let needs = finger_row(
+        "PRJ/repo/1",
+        1,
+        vec![person("jcitizen", ReviewStatus::Unapproved)],
+    );
+    let waiting = finger_row(
+        "PRJ/repo/2",
+        2,
+        vec![person("sam", ReviewStatus::Unapproved)],
+    );
+    let current = finger_snapshot("jcitizen", vec![needs], vec![waiting]);
+    assert_eq!(
+        change_tokens(&diff(None, &current)),
+        vec![
+            ("PRJ/repo/1".to_owned(), vec!["needs_review"]),
+            ("PRJ/repo/2".to_owned(), vec!["waiting"]),
+        ]
+    );
+    assert!(diff(Some(&current), &current).is_empty());
+    let kept = finger_snapshot(
+        "jcitizen",
+        vec![finger_row(
+            "PRJ/repo/1",
+            1,
+            vec![person("jcitizen", ReviewStatus::Unapproved)],
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &kept)),
+        vec![("PRJ/repo/2".to_owned(), vec!["gone"])]
+    );
+    let same_needs = || {
+        finger_row(
+            "PRJ/repo/1",
+            1,
+            vec![person("jcitizen", ReviewStatus::Unapproved)],
+        )
+    };
+    let approved = finger_snapshot(
+        "jcitizen",
+        vec![same_needs()],
+        vec![finger_row(
+            "PRJ/repo/2",
+            2,
+            vec![person("sam", ReviewStatus::Approved)],
+        )],
+    );
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &approved)),
+        vec![("PRJ/repo/2".to_owned(), vec!["approved"])]
+    );
+    let added = finger_snapshot(
+        "jcitizen",
+        vec![same_needs()],
+        vec![finger_row(
+            "PRJ/repo/2",
+            2,
+            vec![
+                person("sam", ReviewStatus::Unapproved),
+                person("alex", ReviewStatus::Approved),
+            ],
+        )],
+    );
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &added)),
+        vec![("PRJ/repo/2".to_owned(), vec!["approved"])]
+    );
+    let needs_work = finger_snapshot(
+        "jcitizen",
+        vec![finger_row(
+            "PRJ/repo/1",
+            1,
+            vec![person("jcitizen", ReviewStatus::NeedsWork)],
+        )],
+        vec![finger_row(
+            "PRJ/repo/2",
+            2,
+            vec![person("sam", ReviewStatus::Unapproved)],
+        )],
+    );
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &needs_work)),
+        vec![("PRJ/repo/1".to_owned(), vec!["needs_work"])]
+    );
+    let mut reviewer_count = finger_row(
+        "PRJ/repo/2",
+        2,
+        vec![person("sam", ReviewStatus::Unapproved)],
+    );
+    reviewer_count.unanswered_as_reviewer = 1;
+    let reviewer_count = finger_snapshot("jcitizen", vec![same_needs()], vec![reviewer_count]);
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &reviewer_count)),
+        vec![("PRJ/repo/2".to_owned(), vec!["unanswered"])]
+    );
+    let mut author_count = finger_row(
+        "PRJ/repo/2",
+        2,
+        vec![person("sam", ReviewStatus::Unapproved)],
+    );
+    author_count.unanswered_as_author = 3;
+    author_count.open_tasks = 2;
+    author_count.build = Build::Failed;
+    let author_count = finger_snapshot("jcitizen", vec![same_needs()], vec![author_count]);
+    assert_eq!(
+        change_tokens(&diff(Some(&current), &author_count)),
+        vec![(
+            "PRJ/repo/2".to_owned(),
+            vec!["unanswered", "tasks", "build_failed"]
+        )]
+    );
+    let mut failed = finger_row("PRJ/repo/2", 2, vec![person("sam", ReviewStatus::Approved)]);
+    failed.build = Build::Failed;
+    failed.conflicted = true;
+    let failed_prev = finger_snapshot("jcitizen", Vec::new(), vec![failed]);
+    let mut failed_next = finger_row("PRJ/repo/2", 2, vec![person("sam", ReviewStatus::Approved)]);
+    failed_next.build = Build::Failed;
+    failed_next.conflicted = true;
+    let failed_next = finger_snapshot("jcitizen", Vec::new(), vec![failed_next]);
+    assert!(diff(Some(&failed_prev), &failed_next).is_empty());
+    let _ = format!(
+        "{:?} {:?} {:?} {:?} {:?}",
+        diff(Some(&current), &author_count),
+        Section::NeedsReview,
+        Section::Waiting,
+        Enrichment::Pending,
+        Build::Successful
+    );
+
+    let dir = temp("finger-disk");
+    write_snapshot(&dir, &current).unwrap();
+    let stored = read_snapshot(&dir).unwrap().unwrap();
+    assert!(diff(Some(&stored), &current).is_empty());
+    assert!(read_snapshot(&temp("finger-missing")).unwrap().is_none());
+    let blocked = temp("finger-blocked");
+    let file = blocked.join("blocked");
+    fs::write(&file, "x").unwrap();
+    assert!(write_snapshot(&file, &current).is_err());
+    let occupied = temp("finger-occupied");
+    fs::create_dir(occupied.join("snapshot.json")).unwrap();
+    assert!(write_snapshot(&occupied, &current).is_err());
+    assert!(read_snapshot(&occupied).is_err());
+    let bad = temp("finger-bad");
+    fs::write(bad.join("snapshot.json"), "{").unwrap();
+    assert!(matches!(read_snapshot(&bad), Err(Error::Json(_))));
+    relax(&dir);
+    fs::remove_dir_all(&dir).unwrap();
+    relax(&blocked);
+    fs::remove_dir_all(&blocked).unwrap();
+    relax(&occupied);
+    fs::remove_dir_all(&occupied).unwrap();
+    relax(&bad);
+    fs::remove_dir_all(&bad).unwrap();
+}
+
+#[test]
+fn snapshot_json_rejects_bad_shapes_and_keeps_status() {
+    let mut marked = finger_row(
+        "PRJ/repo/1",
+        1,
+        vec![person("jcitizen", ReviewStatus::Unapproved)],
+    );
+    marked.can_merge = true;
+    let snapshot = finger_snapshot("jcitizen", vec![marked], Vec::new());
+    let base = json::parse(to_json(&snapshot).as_bytes()).unwrap();
+    for key in [
+        "fetched_ms",
+        "user",
+        "bitbucket",
+        "status",
+        "status_since_ms",
+        "needs_review",
+        "waiting",
+        "truncated",
+        "poll_seconds",
+    ] {
+        let mut value = base.clone();
+        remove_key(&mut value, key);
+        let err = parse_snapshot(&json::to_vec(&value)).unwrap_err();
+        assert!(err.to_string().contains(key), "{err} / {key}");
+    }
+    for key in ["slug", "display_name"] {
+        let mut value = base.clone();
+        remove_key(top(&mut value, "user"), key);
+        let err = parse_snapshot(&json::to_vec(&value)).unwrap_err();
+        assert!(err.to_string().contains(key), "{err}");
+    }
+    for key in ["version", "display_name"] {
+        let mut value = base.clone();
+        remove_key(top(&mut value, "bitbucket"), key);
+        let err = parse_snapshot(&json::to_vec(&value)).unwrap_err();
+        assert!(err.to_string().contains(key), "{err}");
+    }
+    for key in [
+        "id",
+        "project",
+        "repo",
+        "number",
+        "title",
+        "author",
+        "from_branch",
+        "to_branch",
+        "reviewers",
+        "created_ms",
+        "updated_ms",
+        "html_url",
+        "draft",
+        "enrichment",
+        "stale",
+        "needs_work",
+        "unanswered_as_author",
+        "unanswered_as_reviewer",
+        "open_tasks",
+        "build",
+        "conflicted",
+        "can_merge",
+        "fingerprint",
+    ] {
+        let mut value = base.clone();
+        remove_pair(row_fields(&mut value), key);
+        let err = parse_snapshot(&json::to_vec(&value)).unwrap_err();
+        assert!(err.to_string().contains(key), "{err} / {key}");
+    }
+    for key in ["name", "slug", "status"] {
+        let mut value = base.clone();
+        remove_pair(reviewer_fields(&mut value), key);
+        let err = parse_snapshot(&json::to_vec(&value)).unwrap_err();
+        assert!(err.to_string().contains(key), "{err} / {key}");
+    }
+    let mut value = base.clone();
+    replace(top(&mut value, "user"), json::Value::Array(Vec::new()));
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not an object")
+    );
+    let mut value = base.clone();
+    replace(
+        top(&mut value, "needs_review"),
+        json::Value::Object(Vec::new()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not an array")
+    );
+    let mut value = base.clone();
+    replace(
+        top(&mut value, "fetched_ms"),
+        json::Value::String("x".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not an integer")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "title"),
+        json::Value::Bool(true),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not a string")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "draft"),
+        json::Value::String("x".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not a boolean")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "fingerprint"),
+        json::Value::String("00".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint mismatch")
+    );
+    assert!(
+        parse_snapshot(b"[]")
+            .unwrap_err()
+            .to_string()
+            .contains("not an object")
+    );
+    assert!(parse_snapshot(b"{").is_err());
+    let mut value = base.clone();
+    replace(
+        top(&mut value, "needs_review"),
+        json::Value::Array(vec![json::Value::Bool(true)]),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("row is not an object")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "reviewers"),
+        json::Value::Object(Vec::new()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("not an array")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "reviewers"),
+        json::Value::Array(vec![json::Value::Bool(true)]),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("reviewer is not an object")
+    );
+    let mut value = base.clone();
+    replace(
+        top(&mut value, "status"),
+        json::Value::String("nope".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown status")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "enrichment"),
+        json::Value::String("later".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown enrichment")
+    );
+    let mut value = base.clone();
+    replace(
+        row_fields_value(&mut value, "build"),
+        json::Value::String("nope".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown build")
+    );
+    let mut value = base.clone();
+    replace(
+        reviewer_value(&mut value, "status"),
+        json::Value::String("MAYBE".to_owned()),
+    );
+    assert!(
+        parse_snapshot(&json::to_vec(&value))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown status")
+    );
+
+    for status in [
+        SnapshotStatus::Fetching,
+        SnapshotStatus::Ok,
+        SnapshotStatus::Unreachable,
+        SnapshotStatus::Auth,
+        SnapshotStatus::Tls,
+        SnapshotStatus::RateLimited,
+        SnapshotStatus::Error,
+    ] {
+        let mut copy = finger_snapshot(
+            "jcitizen",
+            vec![finger_row(
+                "PRJ/repo/1",
+                1,
+                vec![person("jcitizen", ReviewStatus::Unapproved)],
+            )],
+            Vec::new(),
+        );
+        copy.status = status;
+        let loaded = parse_snapshot(to_json(&copy).as_bytes()).unwrap();
+        assert_eq!(loaded.status, status);
+        let _ = format!("{status:?}");
+    }
+    for build in [
+        Build::None,
+        Build::Successful,
+        Build::InProgress,
+        Build::Failed,
+    ] {
+        let mut row = finger_row(
+            "PRJ/repo/1",
+            1,
+            vec![person("jcitizen", ReviewStatus::Unapproved)],
+        );
+        row.build = build;
+        let copy = finger_snapshot("jcitizen", vec![row], Vec::new());
+        let loaded = parse_snapshot(to_json(&copy).as_bytes()).unwrap();
+        assert_eq!(loaded.needs_review[0].build, build);
+        let _ = format!("{build:?}");
+        assert!(to_json(&copy).contains(match build {
+            Build::None => "none",
+            Build::Successful => "successful",
+            Build::InProgress => "in_progress",
+            Build::Failed => "failed",
+        }));
+    }
+}
+
+fn remove_key(value: &mut json::Value, key: &str) {
+    if let json::Value::Object(pairs) = value {
+        remove_pair(pairs, key);
+    }
+}
+
+fn remove_pair(pairs: &mut Vec<(String, json::Value)>, key: &str) {
+    pairs.retain(|(name, _)| name != key);
+}
+
+fn top<'a>(value: &'a mut json::Value, key: &str) -> &'a mut json::Value {
+    let json::Value::Object(pairs) = value else {
+        panic!("object");
+    };
+    let pair = pairs.iter_mut().find(|(name, _)| name == key).unwrap();
+    &mut pair.1
+}
+
+fn replace(value: &mut json::Value, next: json::Value) {
+    *value = next;
+}
+
+fn row_fields(value: &mut json::Value) -> &mut Vec<(String, json::Value)> {
+    let section = top(value, "needs_review");
+    let json::Value::Array(items) = section else {
+        panic!("rows");
+    };
+    let json::Value::Object(fields) = &mut items[0] else {
+        panic!("row");
+    };
+    fields
+}
+
+fn row_fields_value<'a>(value: &'a mut json::Value, key: &str) -> &'a mut json::Value {
+    let fields = row_fields(value);
+    let pair = fields.iter_mut().find(|(name, _)| name == key).unwrap();
+    &mut pair.1
+}
+
+fn reviewer_fields(value: &mut json::Value) -> &mut Vec<(String, json::Value)> {
+    let reviewers = row_fields_value(value, "reviewers");
+    let json::Value::Array(items) = reviewers else {
+        panic!("reviewers");
+    };
+    let json::Value::Object(fields) = &mut items[0] else {
+        panic!("reviewer");
+    };
+    fields
+}
+
+fn reviewer_value<'a>(value: &'a mut json::Value, key: &str) -> &'a mut json::Value {
+    let fields = reviewer_fields(value);
+    let pair = fields.iter_mut().find(|(name, _)| name == key).unwrap();
+    &mut pair.1
 }

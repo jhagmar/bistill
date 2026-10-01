@@ -89,6 +89,28 @@ pub enum State {
     Declined,
 }
 
+/// Whether enrich fields are on the row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Enrichment {
+    /// Enrich fields are present. List-only rows use the zero defaults.
+    Ready,
+    /// Enrich GETs have not been applied. Those JSON fields are omitted.
+    Pending,
+}
+
+/// Build status for the from-ref commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Build {
+    /// No build result.
+    None,
+    /// A successful build and none failed or in progress.
+    Successful,
+    /// A build is in progress and none failed.
+    InProgress,
+    /// A build failed.
+    Failed,
+}
+
 /// Reviewer status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewStatus {
@@ -139,6 +161,16 @@ pub struct Row {
     pub unanswered_as_reviewer: u64,
     /// Open blocker comments. List rows use 0 until enrichment.
     pub open_tasks: u64,
+    /// `pending` omits the enrich fields. List rows are `ready`.
+    pub enrichment: Enrichment,
+    /// From-ref build. List rows are `none`.
+    pub build: Build,
+    /// Merge `conflicted`. List rows are false.
+    pub conflicted: bool,
+    /// Merge `canMerge`. List rows are false.
+    pub can_merge: bool,
+    /// Lowercase hex record. Empty until the row is placed in a section.
+    pub fingerprint: String,
 }
 
 /// The two sections, oldest update first.
@@ -263,6 +295,11 @@ fn row_from(pr: &PullRequest, base_url: &str, stale: bool, needs_work: bool) -> 
         unanswered_as_author: 0,
         unanswered_as_reviewer: 0,
         open_tasks: 0,
+        enrichment: Enrichment::Ready,
+        build: Build::None,
+        conflicted: false,
+        can_merge: false,
+        fingerprint: String::new(),
     }
 }
 

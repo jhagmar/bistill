@@ -155,6 +155,9 @@ fn render_ls(cwd: &Path, env: &Env, session: &mut dyn Session, ls: &Ls) -> Rende
         Ok(listed) => listed,
         Err(err) => return fail(&err, config.log_file),
     };
+    if let Err(err) = bistill_lib::write_snapshot(&config.state_dir, &listed.snapshot) {
+        return fail(&err, config.log_file);
+    }
     let mut stderr = String::new();
     if ls.verbose {
         for request in &listed.requests {

@@ -21,7 +21,8 @@ bistill ping --url https://git.example.invalid --user jcitizen
 
 `bistill ls` prints Needs review and Waiting on others. An empty list prints
 "Nothing needs your attention." and exits 0. `--count` prints how many pull
-requests need you. `--json` prints the snapshot.
+requests need you. `--json` prints the snapshot. A successful `ls` writes
+`snapshot.json` under `state_dir`.
 
 ```
 bistill ls --url https://git.example.invalid --user jcitizen
