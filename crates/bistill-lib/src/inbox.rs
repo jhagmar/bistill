@@ -46,6 +46,8 @@ pub struct PullRequest {
     pub repo: String,
     /// Source branch `displayId`.
     pub from_branch: String,
+    /// `fromRef.latestCommit`, when the page includes it.
+    pub from_commit: Option<String>,
     /// Destination branch `displayId`.
     pub to_branch: String,
     /// `createdDate` in epoch milliseconds.
@@ -342,6 +344,7 @@ fn pull_request(value: &Value) -> Result<PullRequest, Error> {
         project: required_string(nested(repository, &["project"])?, "key")?,
         repo: required_string(repository, "slug")?,
         from_branch: required_string(from_ref, "displayId")?,
+        from_commit: optional_string(from_ref, "latestCommit")?,
         to_branch: required_string(nested(value, &["toRef"])?, "displayId")?,
         created_ms: required_u64(value, "createdDate")?,
         updated_ms: required_u64(value, "updatedDate")?,
@@ -453,6 +456,16 @@ fn nested<'a>(value: &'a Value, path: &[&str]) -> Result<&'a Value, Error> {
         };
     }
     Ok(current)
+}
+
+fn optional_string(value: &Value, name: &str) -> Result<Option<String>, Error> {
+    match value.get(name) {
+        None => Ok(None),
+        Some(field) => match field.as_str() {
+            Some(text) => Ok(Some(text.to_owned())),
+            None => Err(shape(&format!("{name} is not a string"))),
+        },
+    }
 }
 
 fn required_string(value: &Value, name: &str) -> Result<String, Error> {

@@ -1190,7 +1190,8 @@ fn inbox() -> Snapshot {
 #[test]
 fn screen_draws_both_layouts_and_status_lines() {
     let _ = screen::Screen::default();
-    let snapshot = inbox();
+    let mut snapshot = inbox();
+    snapshot.truncated = 3;
     let holder = screen::Role::Holder(screen::Phase::Fetching);
     let mut screen = screen::Screen::new();
     let wide = draw_screen(&mut screen, 160, 24, Some(&snapshot), &holder, 0);
@@ -1199,6 +1200,7 @@ fn screen_draws_both_layouts_and_status_lines() {
     assert!(top.contains("Waiting"));
     assert_eq!(row_of(&wide, "Detail"), Some(1));
     let shown = grid_text(&wide);
+    assert!(shown.contains("and 3 more"));
     assert!(shown.contains("PRJ/repo#12"));
     assert!(shown.contains("Fix the pipe"));
     assert!(shown.contains("45s"));
