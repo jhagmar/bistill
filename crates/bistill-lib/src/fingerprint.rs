@@ -56,6 +56,20 @@ impl Reason {
             Reason::Gone => "gone",
         }
     }
+
+    /// The English phrase in a notification body.
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Reason::NeedsReview => "needs review",
+            Reason::Waiting => "waiting",
+            Reason::Unanswered => "unanswered comments",
+            Reason::Tasks => "open tasks",
+            Reason::Approved => "approved",
+            Reason::NeedsWork => "needs work",
+            Reason::BuildFailed => "build failed",
+            Reason::Gone => "merged or declined",
+        }
+    }
 }
 
 /// One pull request and the tokens that describe how it changed.
@@ -63,6 +77,8 @@ impl Reason {
 pub struct Change {
     /// `{project}/{repo}/{number}`.
     pub id: String,
+    /// HTML UI URL from the row that owns this change.
+    pub html_url: String,
     /// Tokens in spec-table order.
     pub reasons: Vec<Reason>,
 }
@@ -89,6 +105,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
             match previous.and_then(|snapshot| locate(snapshot, &row.id)) {
                 None => changes.push(Change {
                     id: row.id.clone(),
+                    html_url: row.html_url.clone(),
                     reasons: vec![new_reason(section)],
                 }),
                 Some((_, prev)) => {
@@ -96,6 +113,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
                     if !reasons.is_empty() {
                         changes.push(Change {
                             id: row.id.clone(),
+                            html_url: row.html_url.clone(),
                             reasons,
                         });
                     }
@@ -108,6 +126,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
             if locate(current, &row.id).is_none() {
                 changes.push(Change {
                     id: row.id.clone(),
+                    html_url: row.html_url.clone(),
                     reasons: vec![Reason::Gone],
                 });
             }

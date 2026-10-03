@@ -1,8 +1,9 @@
 //! `bistill ping` and `bistill ls`.
 //!
 //! `ping` lists the curl version, TLS, the Bitbucket version, the user, and
-//! the inbox count. `ls` prints the two inbox sections. `--json` prints the
-//! raw bodies for `ping` and the snapshot for `ls`.
+//! the inbox count. `ls` prints the two inbox sections and notifies when the
+//! snapshot changes. `--json` prints the raw bodies for `ping` and the
+//! snapshot for `ls`.
 
 #![deny(unsafe_code)]
 
@@ -14,6 +15,12 @@ mod curl_bin;
 #[cfg(windows)]
 #[path = "curl_windows.rs"]
 mod curl_bin;
+#[cfg(unix)]
+#[path = "notify_unix.rs"]
+mod notify_bin;
+#[cfg(windows)]
+#[path = "notify_windows.rs"]
+mod notify_bin;
 
 use args::{Command, Ls, Ping};
 use bistill_lib::{
@@ -33,6 +40,8 @@ pub trait Session {
     fn ping(&mut self, client: &Client) -> Result<Report, Error>;
     /// Both inbox roles and the list snapshot.
     fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error>;
+    /// Show one OS notification.
+    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error>;
 }
 
 /// [`Session`] that runs `curl` on this machine.
@@ -49,6 +58,10 @@ impl Session for Live {
 
     fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error> {
         bistill_lib::list_inbox(client, &mut bistill_lib::CurlFetch, now_ms)
+    }
+
+    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
+        host::toast(toast)
     }
 }
 
@@ -150,11 +163,16 @@ fn render_ls(cwd: &Path, env: &Env, session: &mut dyn Session, ls: &Ls) -> Rende
         Ok(config) => config,
         Err(err) => return fail(&err, None),
     };
+    let previous = match bistill_lib::read_snapshot(&config.state_dir) {
+        Ok(previous) => previous,
+        Err(err) => return fail(&err, config.log_file),
+    };
     let client = Client::new(curl_bin::PROGRAM, &config);
     let listed = match session.list(&client, unix_ms(SystemTime::now())) {
         Ok(listed) => listed,
         Err(err) => return fail(&err, config.log_file),
     };
+    let changes = bistill_lib::diff(previous.as_ref(), &listed.snapshot);
     if let Err(err) = bistill_lib::write_snapshot(&config.state_dir, &listed.snapshot) {
         return fail(&err, config.log_file);
     }
@@ -165,6 +183,7 @@ fn render_ls(cwd: &Path, env: &Env, session: &mut dyn Session, ls: &Ls) -> Rende
             stderr.push('\n');
         }
     }
+    stderr.push_str(&send_notices(session, &changes));
     let stdout = if ls.count {
         format!("{}\n", attention_count(&listed.snapshot))
     } else if ls.json {
@@ -223,6 +242,24 @@ fn json_text(snapshot: &Snapshot) -> String {
     let mut text = to_json(snapshot);
     text.push('\n');
     text
+}
+
+fn send_notices(session: &mut dyn Session, changes: &[bistill_lib::Change]) -> String {
+    let mut logged = String::new();
+    for change in changes {
+        let body = bistill_lib::toast_body(change);
+        let toast = notify_bin::desktop_toast(&body, &change.html_url);
+        if let Err(err) = session.notify(&toast) {
+            note(&mut logged, err);
+        }
+    }
+    logged
+}
+
+fn note(logged: &mut String, err: host::Error) {
+    if logged.is_empty() {
+        *logged = explain(&Error::from(err));
+    }
 }
 
 fn fail(err: &Error, log: Option<std::path::PathBuf>) -> Rendered {

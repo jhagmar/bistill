@@ -2,7 +2,8 @@
 //!
 //! This crate owns `key = value` config, environment and flag overrides,
 //! [`Error`], the ping reads, the split of an inbox page into Needs review
-//! and Waiting, and the list snapshot. It does not draw a terminal.
+//! and Waiting, the list snapshot, and notification text. It does not draw a
+//! terminal.
 
 #![deny(unsafe_code)]
 
@@ -10,6 +11,7 @@ mod config;
 mod fingerprint;
 mod inbox;
 mod list;
+mod notify;
 mod ping;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
@@ -24,6 +26,7 @@ pub use json::Error as JsonError;
 pub use list::{
     ENRICH_CAP, Listed, Snapshot, SnapshotStatus, attention_count, list_inbox, to_json,
 };
+pub use notify::{TITLE, toast_body};
 pub use ping::{
     Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
     parse_inbox, parse_product, parse_user, ping, ping_with,

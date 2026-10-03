@@ -1223,6 +1223,38 @@ fn finger_snapshot(slug: &str, needs_review: Vec<Row>, waiting: Vec<Row>) -> Sna
     snapshot
 }
 
+#[test]
+fn toast_body_lists_english_reasons_and_the_link() {
+    let change = Change {
+        id: "PRJ/repo/12".to_owned(),
+        html_url: "https://git.example.invalid/pull/12".to_owned(),
+        reasons: vec![
+            Reason::NeedsReview,
+            Reason::Waiting,
+            Reason::Unanswered,
+            Reason::Tasks,
+            Reason::Approved,
+            Reason::NeedsWork,
+            Reason::BuildFailed,
+            Reason::Gone,
+        ],
+    };
+    assert_eq!(
+        toast_body(&change),
+        "PRJ/repo#12 needs review, waiting, unanswered comments, open tasks, approved, needs work, build failed, merged or declined\nhttps://git.example.invalid/pull/12"
+    );
+    let bare = Change {
+        id: "12".to_owned(),
+        html_url: "https://git.example.invalid/pull/12".to_owned(),
+        reasons: vec![Reason::NeedsReview],
+    };
+    assert_eq!(
+        toast_body(&bare),
+        "12 needs review\nhttps://git.example.invalid/pull/12"
+    );
+    assert_eq!(TITLE, "Bistill");
+}
+
 fn change_tokens(changes: &[Change]) -> Vec<(String, Vec<&str>)> {
     changes
         .iter()
@@ -1298,9 +1330,15 @@ fn fingerprint_diff_and_snapshot_file() {
         )],
         Vec::new(),
     );
+    let gone = diff(Some(&current), &kept);
     assert_eq!(
-        change_tokens(&diff(Some(&current), &kept)),
+        change_tokens(&gone),
         vec![("PRJ/repo/2".to_owned(), vec!["gone"])]
+    );
+    assert_eq!(gone[0].html_url, "https://git.example.invalid/pull/1");
+    assert_eq!(
+        toast_body(&gone[0]),
+        "PRJ/repo#2 merged or declined\nhttps://git.example.invalid/pull/1"
     );
     let same_needs = || {
         finger_row(
