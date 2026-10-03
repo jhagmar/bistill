@@ -39,7 +39,7 @@ pub(crate) struct Outcome {
 
 /// Rows applied so far, and the phase the screen draws.
 pub(crate) struct Board {
-    /// The last applied snapshot. Absent until the first successful poll.
+    /// Rows applied so far. Absent until the first inbox page.
     pub snapshot: Option<Snapshot>,
     /// `Fetching`, `Ready`, or a backoff after a failed poll.
     pub phase: PollPhase,
@@ -134,7 +134,19 @@ pub(crate) fn poll(
             continue;
         }
         set_phase(board, PollPhase::Fetching);
-        match session.poll(&client, now) {
+        let baseline = board.lock().unwrap().snapshot.clone();
+        let write_error = Mutex::new(None);
+        let mut publish = |snapshot: &Snapshot| match write_snapshot(&config.state_dir, snapshot) {
+            Ok(()) => {
+                board.lock().unwrap().snapshot = Some(snapshot.clone());
+                Ok(())
+            }
+            Err(err) => {
+                *write_error.lock().unwrap() = Some(explain(&err));
+                Err(err)
+            }
+        };
+        match session.poll(&client, now, &mut publish) {
             Ok(listed) => {
                 if verbose {
                     for request in &listed.requests {
@@ -142,20 +154,14 @@ pub(crate) fn poll(
                         stderr.push('\n');
                     }
                 }
-                let changes = {
+                let mut changes = diff(baseline.as_ref(), &listed.snapshot);
+                {
                     let mut guard = board.lock().unwrap();
-                    let changes = diff(guard.snapshot.as_ref(), &listed.snapshot);
-                    if let Err(err) = write_snapshot(&config.state_dir, &listed.snapshot) {
-                        return Outcome {
-                            stderr: explain(&err),
-                            code: bistill_lib::exit_code(&err),
-                        };
-                    }
                     guard.note.clear();
                     guard.snapshot = Some(listed.snapshot);
                     guard.phase = PollPhase::Ready;
-                    changes
-                };
+                }
+                session.clarify(&client, &mut changes);
                 stderr.push_str(&send_notices(session, &changes));
                 last_ms = now;
                 gap = Gap::Steady;
@@ -165,6 +171,10 @@ pub(crate) fn poll(
                 if missing_curl(&fault) {
                     stderr.push_str(&explain(&fault.error));
                     return Outcome { stderr, code: 2 };
+                }
+                if let Some(message) = write_error.lock().unwrap().take() {
+                    stderr.push_str(&message);
+                    return Outcome { stderr, code: 1 };
                 }
                 let status = poll_status(&fault.error);
                 let delay = backoff(&mut gap, floor, retry_delay(&fault));

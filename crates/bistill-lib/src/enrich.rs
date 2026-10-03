@@ -66,29 +66,63 @@ pub(crate) fn rank_cmp(left: (u64, u8, usize), right: (u64, u8, usize)) -> Order
         .then(left.2.cmp(&right.2))
 }
 
+/// One enrich reply applied to the row.
+pub(crate) enum Progress {
+    /// Cumulative thread counts through this activities page.
+    Activities { author: u64, reviewer: u64 },
+    /// Open blocker comments through this reply.
+    Tasks { open: u64 },
+    /// Build status for the from-ref commit.
+    Build(Build),
+    /// Merge flags.
+    Merge { conflicted: bool, can_merge: bool },
+}
+
+/// Paths and slugs for one enriched pull request.
+pub(crate) struct Query<'a> {
+    /// Project key.
+    pub project: &'a str,
+    /// Repository slug.
+    pub repo: &'a str,
+    /// Pull request id.
+    pub number: u64,
+    /// Author slug.
+    pub author_slug: &'a str,
+    /// Current user slug.
+    pub user_slug: &'a str,
+    /// `fromRef.latestCommit` when the page has one.
+    pub from_commit: Option<&'a str>,
+}
+
 /// Sequential GETs. `get` receives the path under `base_url`.
+/// `on` runs after each applied reply, before the next request.
 pub(crate) fn fetch(
     get: &mut dyn FnMut(&str) -> Result<host::Response, InboxFault>,
-    project: &str,
-    repo: &str,
-    number: u64,
-    author_slug: &str,
-    user_slug: &str,
-    from_commit: Option<&str>,
+    query: &Query<'_>,
+    on: &mut dyn FnMut(Progress) -> Result<(), InboxFault>,
 ) -> Result<Filled, InboxFault> {
     let base = format!(
-        "/rest/api/1.0/projects/{}/repos/{}/pull-requests/{number}",
-        encode_segment(project),
-        encode_segment(repo),
+        "/rest/api/1.0/projects/{}/repos/{}/pull-requests/{}",
+        encode_segment(query.project),
+        encode_segment(query.repo),
+        query.number,
     );
     let (unanswered_as_author, unanswered_as_reviewer) =
-        activity_counts(get, &base, author_slug, user_slug)?;
-    let open_tasks = open_tasks(get, &base)?;
-    let build = match from_commit {
+        activity_counts(get, &base, query.author_slug, query.user_slug, on)?;
+    let open_tasks = open_tasks(get, &base, on)?;
+    let build = match query.from_commit {
         None => Build::None,
-        Some(commit) => fetch_build(get, commit)?,
+        Some(commit) => {
+            let build = fetch_build(get, commit)?;
+            on(Progress::Build(build))?;
+            build
+        }
     };
     let (conflicted, can_merge) = merge_flags(get, &base)?;
+    on(Progress::Merge {
+        conflicted,
+        can_merge,
+    })?;
     Ok(Filled {
         unanswered_as_author,
         unanswered_as_reviewer,
@@ -113,6 +147,7 @@ fn activity_counts(
     base: &str,
     author_slug: &str,
     user_slug: &str,
+    on: &mut dyn FnMut(Progress) -> Result<(), InboxFault>,
 ) -> Result<(u64, u64), InboxFault> {
     let mut start = 0u64;
     let mut author_n = 0u64;
@@ -125,6 +160,10 @@ fn activity_counts(
             count_activities(&value, author_slug, user_slug).map_err(InboxFault::from)?;
         author_n += page_author;
         reviewer_n += page_reviewer;
+        on(Progress::Activities {
+            author: author_n,
+            reviewer: reviewer_n,
+        })?;
         match page_end(&value).map_err(InboxFault::from)? {
             End::Last => break,
             End::More(next) => {
@@ -141,25 +180,29 @@ fn activity_counts(
 fn open_tasks(
     get: &mut dyn FnMut(&str) -> Result<host::Response, InboxFault>,
     base: &str,
+    on: &mut dyn FnMut(Progress) -> Result<(), InboxFault>,
 ) -> Result<u64, InboxFault> {
     let response = get(&format!("{base}/blocker-comments?state=OPEN&count=true"))?;
     if response.status == 400 {
-        return sum_tasks(get, base, None);
+        return sum_tasks(get, base, None, on);
     }
     if response.status != 200 {
         return Err(http_fault(response.status, response.retry_after));
     }
     let value = parse_body(&response.body)?;
     if value.get("count").is_some() {
-        return required_u64(&value, "count").map_err(InboxFault::from);
+        let open = required_u64(&value, "count").map_err(InboxFault::from)?;
+        on(Progress::Tasks { open })?;
+        return Ok(open);
     }
-    sum_tasks(get, base, Some(value))
+    sum_tasks(get, base, Some(value), on)
 }
 
 fn sum_tasks(
     get: &mut dyn FnMut(&str) -> Result<host::Response, InboxFault>,
     base: &str,
     first: Option<Value>,
+    on: &mut dyn FnMut(Progress) -> Result<(), InboxFault>,
 ) -> Result<u64, InboxFault> {
     let mut start = 0u64;
     let mut total = 0u64;
@@ -173,6 +216,7 @@ fn sum_tasks(
             parse_body(&response.body)?
         };
         total += values_len(&value).map_err(InboxFault::from)?;
+        on(Progress::Tasks { open: total })?;
         match page_end(&value).map_err(InboxFault::from)? {
             End::Last => break,
             End::More(next) => {

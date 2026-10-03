@@ -23,11 +23,15 @@ bistill ping --url https://git.example.invalid --user jcitizen
 "Nothing needs your attention." and exits 0. The first 50 pull requests
 include unanswered threads, open tasks, the build, and merge. `--count`
 prints how many pull requests need you. Waiting rows count when they have
-unanswered author threads or open tasks. `--json` prints the snapshot. A successful `ls` writes
-`snapshot.json` under `state_dir`. When a pull request in that snapshot
-changes, `ls` sends one notification for it. The title is `Bistill`. The
-body names the pull request, the reasons, and the link. If `notify-send` is
-missing, `ls` logs that once and still prints the list.
+unanswered author threads or open tasks. `--json` prints the snapshot. A
+successful `ls` writes `snapshot.json` under `state_dir` as each reply is
+applied. When a pull request in that snapshot changes, `ls` sends one
+notification for it. The title is `Bistill`. The body names the pull request,
+the reasons, and the link. A pull request that left the inbox is named
+`merged` or `declined` when that pull request's state says so. If the read
+fails, the notification says merged or declined. If `notify-send` is
+missing, `ls` logs
+that once and still prints the list.
 
 ```
 bistill ls --url https://git.example.invalid --user jcitizen
@@ -54,14 +58,8 @@ usage and exits 1.
 changes. It writes `snapshot.json`. A second `bistill watch` exits 1 and names
 the pid that holds the lock. A pid that is not running leaves the lock free.
 
-A systemd user service runs the same command. The binary does not install it.
-
-```
-[Service]
-ExecStart=bistill watch
-```
-
-On Windows, a Startup shortcut runs `bistill watch`.
+Linux setup, including a systemd user service, is in `docs/linux.md`. Windows
+setup, including a Startup shortcut, is in `docs/windows.md`.
 
 ## Build
 

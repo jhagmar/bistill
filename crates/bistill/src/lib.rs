@@ -67,12 +67,27 @@ pub trait Session {
     fn version(&mut self, program: &str) -> Result<String, Error>;
     /// The four ping GETs.
     fn ping(&mut self, client: &Client) -> Result<Report, Error>;
-    /// Both inbox roles and the list snapshot.
-    fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error>;
+    /// Both inbox roles and the list snapshot. `publish` runs after each applied reply.
+    fn list(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, Error>;
     /// Show one OS notification.
     fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error>;
     /// One poll. `Retry-After` is kept on HTTP 429.
-    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, InboxFault>;
+    fn poll(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, InboxFault>;
+    /// One GET for each `gone` row. The default leaves the combined phrase.
+    fn clarify(&mut self, client: &Client, changes: &mut [bistill_lib::Change]) {
+        let _ = client;
+        let _ = changes;
+    }
     /// Epoch milliseconds for the poll schedule.
     fn now_ms(&mut self) -> u64 {
         unix_ms(SystemTime::now())
@@ -99,16 +114,30 @@ impl Session for Live {
         bistill_lib::ping(client)
     }
 
-    fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error> {
-        bistill_lib::list_inbox(client, &mut bistill_lib::CurlFetch, now_ms)
+    fn list(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, Error> {
+        bistill_lib::list_inbox(client, &mut bistill_lib::CurlFetch, now_ms, publish)
     }
 
     fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
         host::toast(toast)
     }
 
-    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, InboxFault> {
-        bistill_lib::poll_list(client, &mut bistill_lib::CurlFetch, now_ms)
+    fn poll(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, InboxFault> {
+        bistill_lib::poll_list(client, &mut bistill_lib::CurlFetch, now_ms, publish)
+    }
+
+    fn clarify(&mut self, client: &Client, changes: &mut [bistill_lib::Change]) {
+        bistill_lib::clarify_gone(client, &mut bistill_lib::CurlFetch, changes);
     }
 }
 
@@ -230,14 +259,14 @@ fn render_ls(cwd: &Path, env: &Env, session: &mut dyn Session, ls: &Ls) -> Rende
         Err(err) => return fail(&err, config.log_file),
     };
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let listed = match session.list(&client, unix_ms(SystemTime::now())) {
+    let mut publish =
+        |snapshot: &Snapshot| bistill_lib::write_snapshot(&config.state_dir, snapshot);
+    let listed = match session.list(&client, unix_ms(SystemTime::now()), &mut publish) {
         Ok(listed) => listed,
         Err(err) => return fail(&err, config.log_file),
     };
-    let changes = bistill_lib::diff(previous.as_ref(), &listed.snapshot);
-    if let Err(err) = bistill_lib::write_snapshot(&config.state_dir, &listed.snapshot) {
-        return fail(&err, config.log_file);
-    }
+    let mut changes = bistill_lib::diff(previous.as_ref(), &listed.snapshot);
+    session.clarify(&client, &mut changes);
     let mut stderr = String::new();
     if ls.verbose {
         for request in &listed.requests {

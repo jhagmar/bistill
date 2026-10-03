@@ -11,7 +11,10 @@ pub fn toast_body(change: &Change) -> String {
     let phrases = change
         .reasons
         .iter()
-        .map(|reason| reason.phrase())
+        .map(|reason| match reason {
+            crate::Reason::Gone if !change.gone_text.is_empty() => change.gone_text.as_str(),
+            other => other.phrase(),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     format!("{label} {phrases}\n{}", change.html_url)

@@ -78,10 +78,17 @@ impl Session for Script {
         self.report.take().expect("ping")
     }
 
-    fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error> {
+    fn list(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, Error> {
         let _ = now_ms;
         self.origin = client.requests()[0].url.clone();
-        self.listed.take().expect("list")
+        let listed = self.listed.take().expect("list")?;
+        publish(&listed.snapshot)?;
+        Ok(listed)
     }
 
     fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
@@ -95,8 +102,13 @@ impl Session for Script {
         }
     }
 
-    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, bistill_lib::InboxFault> {
-        self.list(client, now_ms)
+    fn poll(
+        &mut self,
+        client: &Client,
+        now_ms: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, bistill_lib::InboxFault> {
+        self.list(client, now_ms, publish)
             .map_err(|error| bistill_lib::InboxFault {
                 error,
                 retry_after_ms: None,
@@ -835,7 +847,7 @@ fn live_list_reads_http_status() {
     env.base_url = Some(format!("http://127.0.0.1:{port}"));
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let err = match Live.list(&client, 0) {
+    let err = match Live.list(&client, 0, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("expected HTTP 500"),
     };
@@ -2049,7 +2061,12 @@ impl Session for Poller {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(&mut self, _: &Client, _: u64) -> Result<Listed, Error> {
+    fn list(
+        &mut self,
+        _: &Client,
+        _: u64,
+        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, Error> {
         Err(Error::Auth("unused".to_owned()))
     }
 
@@ -2064,7 +2081,12 @@ impl Session for Poller {
         }
     }
 
-    fn poll(&mut self, _: &Client, _: u64) -> Result<Listed, bistill_lib::InboxFault> {
+    fn poll(
+        &mut self,
+        _: &Client,
+        _: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, bistill_lib::InboxFault> {
         self.polls += 1;
         if self.readonly_on == Some(self.polls) {
             self.readonly_on = None;
@@ -2079,7 +2101,16 @@ impl Session for Poller {
                 fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
             }
         }
-        self.steps.remove(0)
+        let result = self.steps.remove(0);
+        if let Ok(listed) = &result {
+            if let Err(error) = publish(&listed.snapshot) {
+                return Err(bistill_lib::InboxFault {
+                    error,
+                    retry_after_ms: None,
+                });
+            }
+        }
+        result
     }
 
     fn now_ms(&mut self) -> u64 {
@@ -2420,11 +2451,57 @@ fn watch_status_follows_the_failure() {
 }
 
 #[test]
+fn live_clarify_reads_a_merged_pull_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    listener.set_nonblocking(true).expect("nonblocking");
+    let thread = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut sock, _)) => {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf);
+                    let body = br#"{"state":"MERGED"}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    let _ = sock.write_all(body);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let cwd = temp("live-gone");
+    let mut env = env_token();
+    env.base_url = Some(format!("http://127.0.0.1:{port}"));
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
+    let client = Client::new(curl_bin::PROGRAM, &config);
+    let mut changes = vec![bistill_lib::Change {
+        id: "PRJ/repo/12".to_owned(),
+        html_url: "https://git.example.invalid/pull/12".to_owned(),
+        reasons: vec![bistill_lib::Reason::Gone],
+        gone_text: String::new(),
+    }];
+    Live.clarify(&client, &mut changes);
+    thread.join().expect("server");
+    assert_eq!(changes[0].gone_text, "merged");
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
 fn live_poll_reports_a_missing_program() {
     let cwd = watch_dir("live-poll");
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
     let client = Client::new("bistill-missing-poll", &config);
-    let err = match Live.poll(&client, 1) {
+    let err = match Live.poll(&client, 1, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("missing"),
     };
@@ -2498,7 +2575,12 @@ impl Session for Inbox {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(&mut self, _: &Client, _: u64) -> Result<Listed, Error> {
+    fn list(
+        &mut self,
+        _: &Client,
+        _: u64,
+        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, Error> {
         Err(Error::Auth("unused".to_owned()))
     }
 
@@ -2506,7 +2588,12 @@ impl Session for Inbox {
         Ok(())
     }
 
-    fn poll(&mut self, _: &Client, _: u64) -> Result<Listed, bistill_lib::InboxFault> {
+    fn poll(
+        &mut self,
+        _: &Client,
+        _: u64,
+        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+    ) -> Result<Listed, bistill_lib::InboxFault> {
         self.polls += 1;
         if let Some(barrier) = &self.barrier {
             if !self.waited {
@@ -2514,7 +2601,16 @@ impl Session for Inbox {
                 barrier.wait();
             }
         }
-        self.steps.remove(0)
+        let result = self.steps.remove(0);
+        if let Ok(listed) = &result {
+            if let Err(error) = publish(&listed.snapshot) {
+                return Err(bistill_lib::InboxFault {
+                    error,
+                    retry_after_ms: None,
+                });
+            }
+        }
+        result
     }
 
     fn now_ms(&mut self) -> u64 {
