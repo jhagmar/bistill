@@ -10,3 +10,4 @@ version.workspace = true
 [dependencies]
 bistill-lib = { path = "../bistill-lib" }
 host = { path = "../host" }
+tui = { path = "../tui" }

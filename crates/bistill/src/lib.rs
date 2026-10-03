@@ -3,11 +3,12 @@
 //! `ping` lists the curl version, TLS, the Bitbucket version, the user, and
 //! the inbox count. `ls` prints the two inbox sections and notifies when the
 //! snapshot changes. `--json` prints the raw bodies for `ping` and the
-//! snapshot for `ls`.
+//! snapshot for `ls`. The screen draws that snapshot on a `tui` buffer.
 
 #![deny(unsafe_code)]
 
 mod args;
+mod screen;
 
 #[cfg(unix)]
 #[path = "curl_unix.rs"]
