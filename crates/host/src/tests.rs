@@ -87,7 +87,8 @@ fn classifies_curl_results() {
         kept,
         Response {
             status: 404,
-            body: b"nope".to_vec()
+            body: b"nope".to_vec(),
+            retry_after: None,
         }
     );
     let empty = interpret("curl", &output(0, b"\n204", "")).unwrap();
@@ -145,9 +146,14 @@ struct Served {
 }
 
 fn serve(status: u16, body: &[u8], hold: bool) -> Served {
+    serve_extra(status, body, hold, "")
+}
+
+fn serve_extra(status: u16, body: &[u8], hold: bool, extra: &str) -> Served {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let body = body.to_vec();
+    let extra = extra.to_owned();
     let (tx, request) = std::sync::mpsc::channel();
     let thread = thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
@@ -160,7 +166,7 @@ fn serve(status: u16, body: &[u8], hold: bool) -> Served {
             return;
         }
         let head = format!(
-            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} X\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let _ = sock.write_all(head.as_bytes());
@@ -189,6 +195,7 @@ fn get_reads_status_headers_and_body() {
         let response = get(&request).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(response.status, status, "{status}");
         assert_eq!(response.body, body);
+        assert_eq!(response.retry_after, None);
         let bytes = served.request.recv().expect("request");
         let seen = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
         assert!(seen.contains("authorization: bearer secret-token"));
@@ -230,6 +237,76 @@ fn get_reports_tls_timeout_and_bad_ca() {
     request.program = "bistill-host-missing-curl".to_owned();
     request.timeout = Duration::from_secs(1);
     assert!(matches!(get(&request), Err(Error::Missing { .. })));
+
+    let limited = serve_extra(429, b"slow", false, "Retry-After: 15\r\n");
+    let mut request = sample(&format!("http://127.0.0.1:{}/", limited.port));
+    request.timeout = Duration::from_secs(2);
+    let response = get(&request).unwrap();
+    assert_eq!(response.status, 429);
+    assert_eq!(response.body, b"slow");
+    assert_eq!(response.retry_after, Some(15));
+    let _ = limited.thread.join();
+}
+
+#[test]
+fn retry_after_reads_a_delay_or_an_http_date() {
+    assert_eq!(
+        retry_after_file(std::path::Path::new("/no/such/bistill-headers"), 0),
+        None
+    );
+    assert_eq!(retry_after_value("Accept: text\n", 0), None);
+    assert_eq!(retry_after_value("Retry-After: 15\n", 0), Some(15));
+    assert_eq!(retry_after_value("retry-after: 0\n", 10), Some(0));
+    assert_eq!(retry_after_value("Retry-After:\n", 0), None);
+    assert_eq!(retry_after_value("Retry-After: nope\n", 0), None);
+    assert_eq!(
+        retry_after_value(
+            "Retry-After: Sun, 06 Nov 1994 08:49:37 GMT\n",
+            784111777 - 10
+        ),
+        Some(10)
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Sun, 06 Nov 1994 08:49:37 GMT\n", 784111777),
+        Some(0)
+    );
+    assert_eq!(
+        retry_after_value(
+            "Retry-After: Sun, 06 Nov 1994 08:49:37 GMT\n",
+            784111777 + 5
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 01 Jan 1970 00:00:00 GMT\n", 0),
+        Some(0)
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 01 Jan 1970 24:00:00 GMT\n", 0),
+        None
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 32 Jan 1970 00:00:00 GMT\n", 0),
+        None
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 01 Foo 1970 00:00:00 GMT\n", 0),
+        None
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 01 Jan 1970 00:00:00 UTC\n", 0),
+        None
+    );
+    assert_eq!(
+        retry_after_value("Retry-After: Thu, 01 Jan 1969 00:00:00 GMT\n", 0),
+        None
+    );
+    assert_eq!(secs_at(std::time::UNIX_EPOCH + Duration::from_secs(5)), 5);
+    let early = std::time::UNIX_EPOCH
+        .checked_sub(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(secs_at(early), 0);
+    let _ = format!("{:?}", sample("https://git.example.invalid"));
 }
 
 fn notify(expire: Option<Duration>) -> Toast {

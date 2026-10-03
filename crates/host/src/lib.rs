@@ -9,10 +9,11 @@
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Why a program or a GET failed.
 #[derive(Debug)]
@@ -94,6 +95,8 @@ pub struct Response {
     pub status: u16,
     /// Response body.
     pub body: Vec<u8>,
+    /// `Retry-After` in seconds, when the header is a delay or an HTTP-date.
+    pub retry_after: Option<u64>,
 }
 
 /// Run `program` with `args` and stop it after `timeout`.
@@ -199,11 +202,119 @@ pub fn arguments(request: &Request) -> Vec<OsString> {
 }
 
 /// GET `request.url` through `curl`.
+///
+/// Response headers are written beside the body so `Retry-After` can be read.
 pub fn get(request: &Request) -> Result<Response, Error> {
-    let args = arguments(request);
+    let header_path = header_path();
+    let args = with_header_dump(arguments(request), &header_path);
     let kill_after = request.timeout.saturating_add(Duration::from_secs(1));
     let output = run(&request.program, &args, kill_after)?;
-    interpret(&request.program, &output)
+    let mut response = interpret(&request.program, &output)?;
+    response.retry_after = retry_after_file(&header_path, unix_secs());
+    let _ = std::fs::remove_file(&header_path);
+    Ok(response)
+}
+
+fn header_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("bistill-headers-{}-{n}", std::process::id()))
+}
+
+fn with_header_dump(mut args: Vec<OsString>, header_path: &Path) -> Vec<OsString> {
+    let at = args.len().saturating_sub(1);
+    args.insert(at, OsString::from("-D"));
+    args.insert(at + 1, header_path.as_os_str().to_owned());
+    args
+}
+
+fn retry_after_file(path: &Path, now_unix: u64) -> Option<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => retry_after_value(&text, now_unix),
+        Err(_) => None,
+    }
+}
+
+pub(crate) fn retry_after_value(headers: &str, now_unix: u64) -> Option<u64> {
+    let value = header_value(headers, "retry-after")?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        Some(seconds)
+    } else {
+        http_date(value).map(|instant| instant.saturating_sub(now_unix))
+    }
+}
+
+fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (key, rest) = line.split_once(':')?;
+        if key.eq_ignore_ascii_case(name) {
+            Some(rest.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn http_date(text: &str) -> Option<u64> {
+    let mut parts = text.split_whitespace();
+    let _weekday = parts.next()?;
+    let day: u64 = parts.next()?.trim_end_matches(',').parse().ok()?;
+    let month = month_index(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    let mut clock = time.split(':');
+    let hour: u64 = clock.next()?.parse().ok()?;
+    let minute: u64 = clock.next()?.parse().ok()?;
+    let second: u64 = clock.next()?.parse().ok()?;
+    if parts.next() == Some("GMT") {
+        unix_from(year, month, day, hour, minute, second)
+    } else {
+        None
+    }
+}
+
+fn month_index(name: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS
+        .iter()
+        .position(|month| month.eq_ignore_ascii_case(name))
+        .map(|index| index as u64 + 1)
+}
+
+fn unix_from(year: i64, month: u64, day: u64, hour: u64, minute: u64, second: u64) -> Option<u64> {
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = civil_days(year, month, day)?;
+    let tod = hour * 3600 + minute * 60 + second;
+    Some(days.saturating_mul(86_400).saturating_add(tod))
+}
+
+fn civil_days(year: i64, month: u64, day: u64) -> Option<u64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let yoe = (shifted - era * 400) as u64;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe as i64 - 719_468;
+    u64::try_from(days).ok()
+}
+
+fn unix_secs() -> u64 {
+    secs_at(SystemTime::now())
+}
+
+pub(crate) fn secs_at(now: SystemTime) -> u64 {
+    match now.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs(),
+        Err(_) => 0,
+    }
 }
 
 pub(crate) fn interpret(program: &str, output: &Output) -> Result<Response, Error> {
@@ -218,7 +329,11 @@ pub(crate) fn interpret(program: &str, output: &Output) -> Result<Response, Erro
         });
     }
     if let Some((status, body)) = split_status(&output.stdout) {
-        return Ok(Response { status, body });
+        return Ok(Response {
+            status,
+            body,
+            retry_after: None,
+        });
     }
     Err(Error::Failed {
         program: program.to_owned(),

@@ -451,6 +451,7 @@ fn step(status: u16, body: &str) -> Result<host::Response, host::Error> {
     Ok(host::Response {
         status,
         body: body.as_bytes().to_vec(),
+        retry_after: None,
     })
 }
 
@@ -1788,4 +1789,65 @@ fn reviewer_value<'a>(value: &'a mut json::Value, key: &str) -> &'a mut json::Va
     let fields = reviewer_fields(value);
     let pair = fields.iter_mut().find(|(name, _)| name == key).unwrap();
     &mut pair.1
+}
+
+#[test]
+fn poll_list_keeps_retry_after_on_429() {
+    let client = ping_client("https://git.example.invalid", "jcitizen");
+    let delayed = Ok(host::Response {
+        status: 429,
+        body: Vec::new(),
+        retry_after: Some(30),
+    });
+    let mut queue = Queue {
+        steps: vec![delayed],
+        urls: Vec::new(),
+    };
+    let err = match poll_list(&client, &mut queue, 1) {
+        Err(err) => err,
+        Ok(_) => panic!("429"),
+    };
+    assert!(matches!(err.error, Error::Http(429)));
+    assert_eq!(err.retry_after_ms, Some(30_000));
+
+    let open = Ok(host::Response {
+        status: 429,
+        body: Vec::new(),
+        retry_after: None,
+    });
+    let mut queue = Queue {
+        steps: vec![open],
+        urls: Vec::new(),
+    };
+    let err = match poll_list(&client, &mut queue, 1) {
+        Err(err) => err,
+        Ok(_) => panic!("429"),
+    };
+    assert_eq!(err.retry_after_ms, None);
+
+    let mut queue = Queue {
+        steps: vec![step(500, "")],
+        urls: Vec::new(),
+    };
+    let err = match poll_list(&client, &mut queue, 1) {
+        Err(err) => err,
+        Ok(_) => panic!("500"),
+    };
+    assert!(matches!(err.error, Error::Http(500)));
+    assert_eq!(err.retry_after_ms, None);
+
+    let huge = Ok(host::Response {
+        status: 429,
+        body: Vec::new(),
+        retry_after: Some(u64::MAX),
+    });
+    let mut queue = Queue {
+        steps: vec![huge],
+        urls: Vec::new(),
+    };
+    let err = match poll_list(&client, &mut queue, 1) {
+        Err(err) => err,
+        Ok(_) => panic!("429"),
+    };
+    assert_eq!(err.retry_after_ms, Some(u64::MAX));
 }

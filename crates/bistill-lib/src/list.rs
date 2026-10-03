@@ -69,8 +69,34 @@ pub struct Listed {
     pub requests: Vec<host::Request>,
 }
 
+/// A failed list. `retry_after_ms` is set from `Retry-After` on HTTP 429.
+pub struct InboxFault {
+    /// The failure.
+    pub error: Error,
+    /// Delay from `Retry-After`, in milliseconds.
+    pub retry_after_ms: Option<u64>,
+}
+
+impl From<Error> for InboxFault {
+    fn from(error: Error) -> Self {
+        InboxFault {
+            error,
+            retry_after_ms: None,
+        }
+    }
+}
+
 /// Read both inbox roles and build a list snapshot.
 pub fn list_inbox(client: &Client, fetch: &mut dyn Fetch, now_ms: u64) -> Result<Listed, Error> {
+    poll_list(client, fetch, now_ms).map_err(|fault| fault.error)
+}
+
+/// [`list_inbox`] plus `Retry-After` when the failing response carries it.
+pub fn poll_list(
+    client: &Client,
+    fetch: &mut dyn Fetch,
+    now_ms: u64,
+) -> Result<Listed, InboxFault> {
     let mut requests = Vec::new();
     let product = fetch_ok(
         client,
@@ -137,7 +163,7 @@ fn role_pages(
     fetch: &mut dyn Fetch,
     requests: &mut Vec<host::Request>,
     role: &str,
-) -> Result<Vec<crate::inbox::PullRequest>, Error> {
+) -> Result<Vec<crate::inbox::PullRequest>, InboxFault> {
     let mut role = role.to_owned();
     let mut start = 0u64;
     let mut out = Vec::new();
@@ -149,7 +175,7 @@ fn role_pages(
             continue;
         }
         if response.status != 200 {
-            return Err(Error::Http(response.status));
+            return Err(http_fault(response.status, response.retry_after));
         }
         let page = parse_page(&response.body)?;
         out.extend(page.values);
@@ -157,7 +183,7 @@ fn role_pages(
             PageEnd::Last => break,
             PageEnd::More { next_page_start } => {
                 if next_page_start <= start {
-                    return Err(shape("nextPageStart did not advance"));
+                    return Err(shape("nextPageStart did not advance").into());
                 }
                 start = next_page_start;
             }
@@ -171,12 +197,24 @@ fn fetch_ok(
     fetch: &mut dyn Fetch,
     requests: &mut Vec<host::Request>,
     path: &str,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, InboxFault> {
     let response = fetch_raw(client, fetch, requests, path)?;
     if response.status != 200 {
-        return Err(Error::Http(response.status));
+        return Err(http_fault(response.status, response.retry_after));
     }
     Ok(response.body)
+}
+
+fn http_fault(status: u16, retry_after: Option<u64>) -> InboxFault {
+    let retry_after_ms = if status == 429 {
+        retry_after.map(|seconds| seconds.saturating_mul(1000))
+    } else {
+        None
+    };
+    InboxFault {
+        error: Error::Http(status),
+        retry_after_ms,
+    }
 }
 
 fn fetch_raw(

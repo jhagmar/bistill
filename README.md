@@ -38,6 +38,21 @@ https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/12"
 
 On Windows, `ls` shows a PowerShell toast. A click opens the pull request.
 
+## watch
+
+`bistill watch` polls on this process and sends a notification when the inbox
+changes. It writes `snapshot.json`. A second `bistill watch` exits 1 and names
+the pid that holds the lock. A pid that is not running leaves the lock free.
+
+A systemd user service runs the same command. The binary does not install it.
+
+```
+[Service]
+ExecStart=bistill watch
+```
+
+On Windows, a Startup shortcut runs `bistill watch`.
+
 ## Build
 
 MSRV is 1.85. Edition 2024.
