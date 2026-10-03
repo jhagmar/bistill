@@ -70,7 +70,7 @@ pub struct UserRef {
 }
 
 /// One reviewer.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Reviewer {
     /// `displayName`.
     pub name: String,
@@ -125,7 +125,7 @@ pub enum ReviewStatus {
 }
 
 /// An OPEN pull request in one section.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Row {
     /// `{project}/{repo}/{number}`.
     pub id: String,
@@ -338,7 +338,7 @@ fn pull_request(value: &Value) -> Result<PullRequest, Error> {
     Ok(PullRequest {
         number: required_u64(value, "id")?,
         title: required_string(value, "title")?,
-        state: state(required_string(value, "state")?.as_str())?,
+        state: parse_state(required_string(value, "state")?.as_str())?,
         author: user_ref(nested(value, &["author", "user"])?)?,
         reviewers: reviewers(value)?,
         project: required_string(nested(repository, &["project"])?, "key")?,
@@ -389,7 +389,7 @@ fn user_ref(value: &Value) -> Result<UserRef, Error> {
     })
 }
 
-fn state(text: &str) -> Result<State, Error> {
+pub(crate) fn parse_state(text: &str) -> Result<State, Error> {
     match text {
         "OPEN" => Ok(State::Open),
         "MERGED" => Ok(State::Merged),

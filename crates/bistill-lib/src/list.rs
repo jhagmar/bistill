@@ -10,8 +10,8 @@ use crate::Error;
 use crate::enrich::{self, Source};
 use crate::fingerprint;
 use crate::inbox::{
-    Build, Enrichment, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections, classify,
-    parse_page,
+    Build, Enrichment, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections, State,
+    classify, parse_page, parse_state,
 };
 use crate::ping::{Client, Fetch, encode_segment, parse_product, parse_user};
 use json::Value;
@@ -39,7 +39,7 @@ pub enum SnapshotStatus {
 pub const ENRICH_CAP: usize = 50;
 
 /// A list snapshot. `ls --json` prints [`to_json`] of this value.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     /// When the list was read, epoch milliseconds.
     pub fetched_ms: u64,
@@ -92,8 +92,14 @@ impl From<Error> for InboxFault {
 }
 
 /// Read both inbox roles and build a list snapshot.
-pub fn list_inbox(client: &Client, fetch: &mut dyn Fetch, now_ms: u64) -> Result<Listed, Error> {
-    poll_list(client, fetch, now_ms).map_err(|fault| fault.error)
+/// `publish` runs after each applied inbox page and enrich reply.
+pub fn list_inbox(
+    client: &Client,
+    fetch: &mut dyn Fetch,
+    now_ms: u64,
+    publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
+) -> Result<Listed, Error> {
+    poll_list(client, fetch, now_ms, publish).map_err(|fault| fault.error)
 }
 
 /// [`list_inbox`] plus `Retry-After` when the failing response carries it.
@@ -101,6 +107,7 @@ pub fn poll_list(
     client: &Client,
     fetch: &mut dyn Fetch,
     now_ms: u64,
+    publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
 ) -> Result<Listed, InboxFault> {
     let mut requests = Vec::new();
     let product = fetch_ok(
@@ -113,35 +120,99 @@ pub fn poll_list(
     let user_path = format!("/rest/api/1.0/users/{}", encode_segment(client.username()));
     let user = fetch_ok(client, fetch, &mut requests, &user_path)?;
     let user = parse_user(client.username(), &user)?;
-    let mut prs = role_pages(client, fetch, &mut requests, "REVIEWER")?;
-    prs.extend(role_pages(client, fetch, &mut requests, "AUTHOR")?);
+    let mut prs = Vec::new();
+    for role in ["REVIEWER", "AUTHOR"] {
+        role_pages(client, fetch, &mut requests, role, &mut prs, &mut |rows| {
+            let mut snapshot = assemble(client, &product, &user, rows, now_ms);
+            fingerprint::stamp(&mut snapshot);
+            publish(&snapshot).map_err(InboxFault::from)
+        })?;
+    }
     let sources = sources_of(&prs);
+    let mut listed = Listed {
+        snapshot: assemble(client, &product, &user, &prs, now_ms),
+        requests,
+    };
+    enrich_listed(client, fetch, &mut listed, &sources, publish)?;
+    fingerprint::stamp(&mut listed.snapshot);
+    publish(&listed.snapshot)?;
+    Ok(listed)
+}
+
+fn assemble(
+    client: &Client,
+    product: &crate::ping::Product,
+    user: &crate::ping::User,
+    prs: &[PullRequest],
+    now_ms: u64,
+) -> Snapshot {
     let sections = classify(
-        &prs,
+        prs,
         &user.slug,
         client.base_url(),
         now_ms,
         client.stale_days(),
     );
-    let mut listed = Listed {
-        snapshot: Snapshot {
-            fetched_ms: now_ms,
-            user_slug: user.slug,
-            user_name: user.display_name,
-            bitbucket_version: product.version,
-            bitbucket_name: product.display_name,
-            status: SnapshotStatus::Ok,
-            status_since_ms: now_ms,
-            truncated: truncated(&sections),
-            poll_seconds: client.poll_seconds(),
-            needs_review: sections.needs_review,
-            waiting: sections.waiting,
-        },
-        requests,
+    Snapshot {
+        fetched_ms: now_ms,
+        user_slug: user.slug.clone(),
+        user_name: user.display_name.clone(),
+        bitbucket_version: product.version.clone(),
+        bitbucket_name: product.display_name.clone(),
+        status: SnapshotStatus::Ok,
+        status_since_ms: now_ms,
+        truncated: truncated(&sections),
+        poll_seconds: client.poll_seconds(),
+        needs_review: sections.needs_review,
+        waiting: sections.waiting,
+    }
+}
+
+/// One GET of a pull request that left the inbox. A failure leaves the default phrase.
+pub fn clarify_gone(client: &Client, fetch: &mut dyn Fetch, changes: &mut [crate::Change]) {
+    for change in changes {
+        if change.reasons.contains(&crate::Reason::Gone) {
+            change.gone_text = gone_word(client, fetch, &change.id);
+        }
+    }
+}
+
+fn gone_word(client: &Client, fetch: &mut dyn Fetch, id: &str) -> String {
+    let Some((project, repo, number)) = split_id(id) else {
+        return String::new();
     };
-    enrich_listed(client, fetch, &mut listed, &sources)?;
-    fingerprint::stamp(&mut listed.snapshot);
-    Ok(listed)
+    let path = format!(
+        "/rest/api/1.0/projects/{}/repos/{}/pull-requests/{number}",
+        encode_segment(project),
+        encode_segment(repo),
+    );
+    let mut requests = Vec::new();
+    let response = match fetch_raw(client, fetch, &mut requests, &path) {
+        Ok(response) => response,
+        Err(_) => return String::new(),
+    };
+    if response.status != 200 {
+        return String::new();
+    }
+    match pr_state(&response.body) {
+        Ok(State::Merged) => "merged".to_owned(),
+        Ok(State::Declined) => "declined".to_owned(),
+        Ok(State::Open) | Err(_) => String::new(),
+    }
+}
+
+fn split_id(id: &str) -> Option<(&str, &str, &str)> {
+    let (path, number) = id.rsplit_once('/')?;
+    let (project, repo) = path.rsplit_once('/')?;
+    Some((project, repo, number))
+}
+
+fn pr_state(body: &[u8]) -> Result<State, Error> {
+    let value = json::parse(body)?;
+    match value.get("state").and_then(|state| state.as_str()) {
+        Some(text) => parse_state(text),
+        None => Err(shape("missing state")),
+    }
 }
 
 fn sources_of(prs: &[PullRequest]) -> HashMap<String, Source> {
@@ -163,6 +234,7 @@ fn enrich_listed(
     fetch: &mut dyn Fetch,
     listed: &mut Listed,
     sources: &HashMap<String, Source>,
+    publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
 ) -> Result<(), InboxFault> {
     let user_slug = listed.snapshot.user_slug.clone();
     let chosen = enrich::slots(
@@ -173,17 +245,25 @@ fn enrich_listed(
     for slot in chosen {
         let (project, repo, number, source) = target(&listed.snapshot, slot, sources);
         let filled = {
-            let requests = &mut listed.requests;
+            let Listed { snapshot, requests } = listed;
             let mut get =
                 |path: &str| fetch_raw(client, fetch, requests, path).map_err(InboxFault::from);
+            let mut on = |progress| {
+                note_progress(snapshot, slot, progress);
+                fingerprint::stamp(snapshot);
+                publish(snapshot).map_err(InboxFault::from)
+            };
             enrich::fetch(
                 &mut get,
-                &project,
-                &repo,
-                number,
-                &source.author_slug,
-                &user_slug,
-                source.from_commit.as_deref(),
+                &enrich::Query {
+                    project: &project,
+                    repo: &repo,
+                    number,
+                    author_slug: &source.author_slug,
+                    user_slug: &user_slug,
+                    from_commit: source.from_commit.as_deref(),
+                },
+                &mut on,
             )?
         };
         match slot {
@@ -196,6 +276,28 @@ fn enrich_listed(
         }
     }
     Ok(())
+}
+
+fn note_progress(snapshot: &mut Snapshot, slot: enrich::Slot, progress: enrich::Progress) {
+    let row = match slot {
+        enrich::Slot::Needs(index) => &mut snapshot.needs_review[index],
+        enrich::Slot::Waiting(index) => &mut snapshot.waiting[index],
+    };
+    match progress {
+        enrich::Progress::Activities { author, reviewer } => {
+            row.unanswered_as_author = author;
+            row.unanswered_as_reviewer = reviewer;
+        }
+        enrich::Progress::Tasks { open } => row.open_tasks = open,
+        enrich::Progress::Build(build) => row.build = build,
+        enrich::Progress::Merge {
+            conflicted,
+            can_merge,
+        } => {
+            row.conflicted = conflicted;
+            row.can_merge = can_merge;
+        }
+    }
 }
 
 fn target(
@@ -237,10 +339,11 @@ fn role_pages(
     fetch: &mut dyn Fetch,
     requests: &mut Vec<host::Request>,
     role: &str,
-) -> Result<Vec<crate::inbox::PullRequest>, InboxFault> {
+    prs: &mut Vec<PullRequest>,
+    after_page: &mut dyn FnMut(&[PullRequest]) -> Result<(), InboxFault>,
+) -> Result<(), InboxFault> {
     let mut role = role.to_owned();
     let mut start = 0u64;
-    let mut out = Vec::new();
     loop {
         let path = format!("/rest/api/1.0/inbox/pull-requests?role={role}&start={start}&limit=25");
         let response = fetch_raw(client, fetch, requests, &path)?;
@@ -252,7 +355,8 @@ fn role_pages(
             return Err(http_fault(response.status, response.retry_after));
         }
         let page = parse_page(&response.body)?;
-        out.extend(page.values);
+        prs.extend(page.values);
+        after_page(prs)?;
         match page.end {
             PageEnd::Last => break,
             PageEnd::More { next_page_start } => {
@@ -263,7 +367,7 @@ fn role_pages(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn fetch_ok(

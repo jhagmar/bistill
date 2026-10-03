@@ -1041,7 +1041,7 @@ fn run_list(
         steps,
         urls: Vec::new(),
     };
-    let result = list_inbox(&client, &mut queue, NOW_MS);
+    let result = list_inbox(&client, &mut queue, NOW_MS, &mut |_| Ok(()));
     (result, queue.urls)
 }
 
@@ -1272,15 +1272,24 @@ fn toast_body_lists_english_reasons_and_the_link() {
             Reason::BuildFailed,
             Reason::Gone,
         ],
+        gone_text: String::new(),
     };
     assert_eq!(
         toast_body(&change),
         "PRJ/repo#12 needs review, waiting, unanswered comments, open tasks, approved, needs work, build failed, merged or declined\nhttps://git.example.invalid/pull/12"
     );
+    let mut merged = change;
+    merged.reasons = vec![Reason::Gone];
+    merged.gone_text = "merged".to_owned();
+    assert!(toast_body(&merged).contains("merged\n"));
+    merged.gone_text = "declined".to_owned();
+    assert!(toast_body(&merged).contains("declined\n"));
+    let _ = format!("{merged:?}");
     let bare = Change {
         id: "12".to_owned(),
         html_url: "https://git.example.invalid/pull/12".to_owned(),
         reasons: vec![Reason::NeedsReview],
+        gone_text: String::new(),
     };
     assert_eq!(
         toast_body(&bare),
@@ -1836,7 +1845,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![delayed],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1) {
+    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1852,7 +1861,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![open],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1) {
+    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1862,7 +1871,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![step(500, "")],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1) {
+    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("500"),
     };
@@ -1878,7 +1887,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![huge],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1) {
+    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1917,7 +1926,18 @@ fn scripted(
                 Err(err) => Err(InboxFault::from(Error::from(err))),
             }
         };
-        enrich::fetch(&mut get, "~me", "repo", 9, "pat", "jcitizen", commit)
+        enrich::fetch(
+            &mut get,
+            &enrich::Query {
+                project: "~me",
+                repo: "repo",
+                number: 9,
+                author_slug: "pat",
+                user_slug: "jcitizen",
+                from_commit: commit,
+            },
+            &mut |_| Ok(()),
+        )
     };
     (result, urls)
 }
@@ -1945,6 +1965,7 @@ fn list_enriches_threads_tasks_build_and_merge() {
         step(200, "{}"),
     ]);
     let listed = listed.unwrap();
+    let _ = listed.snapshot.clone();
     let row = &listed.snapshot.needs_review[0];
     assert_eq!(row.unanswered_as_author, 5);
     assert_eq!(row.unanswered_as_reviewer, 1);
@@ -2241,4 +2262,142 @@ fn enrich_keeps_the_oldest_fifty() {
         enrich::rank_cmp((1, 0, 0), (1, 0, 0)),
         std::cmp::Ordering::Equal
     );
+}
+
+#[test]
+fn poll_publishes_each_reply_and_stops_when_publish_fails() {
+    let (quiet, _) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, EMPTY_PAGE),
+        step(200, EMPTY_PAGE),
+    ]);
+    assert!(quiet.is_ok());
+    let mut seen = 0u32;
+    let client = ping_client("https://git.example.invalid", "jcitizen");
+    let mut queue = Queue {
+        steps: vec![
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, EMPTY_PAGE),
+            step(200, EMPTY_PAGE),
+        ],
+        urls: Vec::new(),
+    };
+    let counted = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+        seen += 1;
+        Ok(())
+    });
+    assert!(counted.is_ok());
+    assert_eq!(seen, 3);
+    let mut queue = Queue {
+        steps: vec![step(200, APP), step(200, USER_JSON), step(200, EMPTY_PAGE)],
+        urls: Vec::new(),
+    };
+    let err = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+        Err(Error::Io(std::io::Error::other("disk")))
+    });
+    let Err(err) = err else { panic!("disk") };
+    assert!(err.error.to_string().contains("disk"));
+    let page = page_body(&listed_pr(1, "pat", true, None), "true", None);
+    let mut calls = 0u32;
+    let mut queue = Queue {
+        steps: vec![
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, &page),
+            step(200, EMPTY_PAGE),
+            step(200, EMPTY_PAGE),
+        ],
+        urls: Vec::new(),
+    };
+    let err = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+        calls += 1;
+        if calls == 3 {
+            Err(Error::Io(std::io::Error::other("disk")))
+        } else {
+            Ok(())
+        }
+    });
+    let Err(err) = err else { panic!("disk") };
+    assert!(err.error.to_string().contains("disk"));
+    let mut steps = vec![step(200, EMPTY_PAGE)];
+    let mut get = |_: &str| match steps.remove(0) {
+        Ok(response) => Ok(response),
+        Err(err) => Err(InboxFault::from(Error::from(err))),
+    };
+    let err = enrich::fetch(
+        &mut get,
+        &enrich::Query {
+            project: "PRJ",
+            repo: "repo",
+            number: 1,
+            author_slug: "pat",
+            user_slug: "jcitizen",
+            from_commit: None,
+        },
+        &mut |_| Err(InboxFault::from(Error::Io(std::io::Error::other("stop")))),
+    );
+    assert!(err.unwrap_err().error.to_string().contains("stop"));
+}
+
+#[test]
+fn clarify_gone_reads_merged_or_declined() {
+    let mut changes = vec![
+        Change {
+            id: "PRJ/repo/12".to_owned(),
+            html_url: "https://git.example.invalid/pull/12".to_owned(),
+            reasons: vec![Reason::NeedsReview],
+            gone_text: String::new(),
+        },
+        Change {
+            id: "nope".to_owned(),
+            html_url: "https://git.example.invalid/pull/0".to_owned(),
+            reasons: vec![Reason::Gone],
+            gone_text: String::new(),
+        },
+    ];
+    let client = ping_client("https://git.example.invalid", "jcitizen");
+    let mut queue = Queue {
+        steps: Vec::new(),
+        urls: Vec::new(),
+    };
+    clarify_gone(&client, &mut queue, &mut changes);
+    assert!(changes[0].gone_text.is_empty());
+    assert!(changes[1].gone_text.is_empty());
+    let mut gone = changes.pop().unwrap();
+    gone.id = "PRJ/repo/12".to_owned();
+    let cases = [
+        (step(200, r#"{"state":"MERGED"}"#), "merged"),
+        (step(200, r#"{"state":"DECLINED"}"#), "declined"),
+        (step(200, r#"{"state":"OPEN"}"#), ""),
+        (step(200, r#"{"state":"NOPE"}"#), ""),
+        (step(200, "{}"), ""),
+        (step(200, "{"), ""),
+        (step(404, "no"), ""),
+        (
+            Err(host::Error::Timeout {
+                program: "curl".to_owned(),
+            }),
+            "",
+        ),
+    ];
+    for (response, word) in cases {
+        gone.gone_text = "stale".to_owned();
+        let mut queue = Queue {
+            steps: vec![response],
+            urls: Vec::new(),
+        };
+        let mut one = [gone.clone()];
+        clarify_gone(&client, &mut queue, &mut one);
+        assert_eq!(one[0].gone_text, word);
+        gone = one[0].clone();
+    }
+    gone.id = "~me/repo/3".to_owned();
+    let mut queue = Queue {
+        steps: vec![step(200, r#"{"state":"MERGED"}"#)],
+        urls: Vec::new(),
+    };
+    clarify_gone(&client, &mut queue, &mut [gone]);
+    assert!(queue.urls[0].contains("/projects/~me/repos/repo/pull-requests/3"));
 }

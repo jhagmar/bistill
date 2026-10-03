@@ -73,7 +73,7 @@ impl Reason {
 }
 
 /// One pull request and the tokens that describe how it changed.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Change {
     /// `{project}/{repo}/{number}`.
     pub id: String,
@@ -81,6 +81,8 @@ pub struct Change {
     pub html_url: String,
     /// Tokens in spec-table order.
     pub reasons: Vec<Reason>,
+    /// English for [`Reason::Gone`] after the pull request GET. Empty keeps the default phrase.
+    pub gone_text: String,
 }
 
 /// Fill [`Row::fingerprint`] for every row.
@@ -107,6 +109,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
                     id: row.id.clone(),
                     html_url: row.html_url.clone(),
                     reasons: vec![new_reason(section)],
+                    gone_text: String::new(),
                 }),
                 Some((_, prev)) => {
                     let reasons = reasons(prev, row, section);
@@ -115,6 +118,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
                             id: row.id.clone(),
                             html_url: row.html_url.clone(),
                             reasons,
+                            gone_text: String::new(),
                         });
                     }
                 }
@@ -128,6 +132,7 @@ pub fn diff(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
                     id: row.id.clone(),
                     html_url: row.html_url.clone(),
                     reasons: vec![Reason::Gone],
+                    gone_text: String::new(),
                 });
             }
         }
