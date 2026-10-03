@@ -2,12 +2,16 @@
 //!
 //! [`list_inbox`] reads application-properties, the user, and both inbox roles.
 //! It follows `nextPageStart` and retries a role in lowercase after HTTP 400.
-//! The snapshot is list-only: enrichment counts stay 0, `build` is `none`.
+//! The first 50 OPEN rows are enriched. The rest stay at the list-only defaults.
+
+use std::collections::HashMap;
 
 use crate::Error;
+use crate::enrich::{self, Source};
 use crate::fingerprint;
 use crate::inbox::{
-    Build, Enrichment, PageEnd, ReviewStatus, Reviewer, Row, Sections, classify, parse_page,
+    Build, Enrichment, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections, classify,
+    parse_page,
 };
 use crate::ping::{Client, Fetch, encode_segment, parse_product, parse_user};
 use json::Value;
@@ -70,6 +74,7 @@ pub struct Listed {
 }
 
 /// A failed list. `retry_after_ms` is set from `Retry-After` on HTTP 429.
+#[derive(Debug)]
 pub struct InboxFault {
     /// The failure.
     pub error: Error,
@@ -110,6 +115,7 @@ pub fn poll_list(
     let user = parse_user(client.username(), &user)?;
     let mut prs = role_pages(client, fetch, &mut requests, "REVIEWER")?;
     prs.extend(role_pages(client, fetch, &mut requests, "AUTHOR")?);
+    let sources = sources_of(&prs);
     let sections = classify(
         &prs,
         &user.slug,
@@ -133,8 +139,76 @@ pub fn poll_list(
         },
         requests,
     };
+    enrich_listed(client, fetch, &mut listed, &sources)?;
     fingerprint::stamp(&mut listed.snapshot);
     Ok(listed)
+}
+
+fn sources_of(prs: &[PullRequest]) -> HashMap<String, Source> {
+    let mut sources = HashMap::new();
+    for pr in prs {
+        sources.insert(
+            format!("{}/{}/{}", pr.project, pr.repo, pr.number),
+            Source {
+                author_slug: pr.author.slug.clone(),
+                from_commit: pr.from_commit.clone(),
+            },
+        );
+    }
+    sources
+}
+
+fn enrich_listed(
+    client: &Client,
+    fetch: &mut dyn Fetch,
+    listed: &mut Listed,
+    sources: &HashMap<String, Source>,
+) -> Result<(), InboxFault> {
+    let user_slug = listed.snapshot.user_slug.clone();
+    let chosen = enrich::slots(
+        &listed.snapshot.needs_review,
+        &listed.snapshot.waiting,
+        ENRICH_CAP,
+    );
+    for slot in chosen {
+        let (project, repo, number, source) = target(&listed.snapshot, slot, sources);
+        let filled = {
+            let requests = &mut listed.requests;
+            let mut get =
+                |path: &str| fetch_raw(client, fetch, requests, path).map_err(InboxFault::from);
+            enrich::fetch(
+                &mut get,
+                &project,
+                &repo,
+                number,
+                &source.author_slug,
+                &user_slug,
+                source.from_commit.as_deref(),
+            )?
+        };
+        match slot {
+            enrich::Slot::Needs(index) => {
+                enrich::write(&mut listed.snapshot.needs_review[index], filled);
+            }
+            enrich::Slot::Waiting(index) => {
+                enrich::write(&mut listed.snapshot.waiting[index], filled);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn target(
+    snapshot: &Snapshot,
+    slot: enrich::Slot,
+    sources: &HashMap<String, Source>,
+) -> (String, String, u64, Source) {
+    let row = match slot {
+        enrich::Slot::Needs(index) => &snapshot.needs_review[index],
+        enrich::Slot::Waiting(index) => &snapshot.waiting[index],
+    };
+    let source = sources[&row.id].clone();
+    (row.project.clone(), row.repo.clone(), row.number, source)
 }
 
 /// Needs review, plus Waiting rows whose author-thread or task count is above 0.

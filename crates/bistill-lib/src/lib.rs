@@ -1,4 +1,4 @@
-//! Config, the process error type, ping, inbox classification, and `ls`.
+//! Config, the process error type, ping, inbox classification, enrichment, and `ls`.
 //!
 //! This crate owns `key = value` config, environment and flag overrides,
 //! [`Error`], the ping reads, the split of an inbox page into Needs review
@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 
 mod config;
+mod enrich;
 mod fingerprint;
 mod inbox;
 mod list;

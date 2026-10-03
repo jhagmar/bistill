@@ -20,8 +20,10 @@ bistill ping --url https://git.example.invalid --user jcitizen
 ## ls
 
 `bistill ls` prints Needs review and Waiting on others. An empty list prints
-"Nothing needs your attention." and exits 0. `--count` prints how many pull
-requests need you. `--json` prints the snapshot. A successful `ls` writes
+"Nothing needs your attention." and exits 0. The first 50 pull requests
+include unanswered threads, open tasks, the build, and merge. `--count`
+prints how many pull requests need you. Waiting rows count when they have
+unanswered author threads or open tasks. `--json` prints the snapshot. A successful `ls` writes
 `snapshot.json` under `state_dir`. When a pull request in that snapshot
 changes, `ls` sends one notification for it. The title is `Bistill`. The
 body names the pull request, the reasons, and the link. If `notify-send` is

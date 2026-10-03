@@ -1,0 +1,15 @@
+{
+  "values": [
+    { "state": "SUCCESS" },
+    { "state": "SUCCESSFUL" },
+    { "status": "INPROGRESS" },
+    { "status": "IN_PROGRESS" },
+    { "state": "RUNNING" },
+    { "state": "FAILED" },
+    { "state": "FAILURE" },
+    { "state": "ERROR" },
+    { "state": "CANCELLED" },
+    {},
+    { "state": "SUCCESS" }
+  ]
+}

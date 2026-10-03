@@ -237,7 +237,10 @@ fn paint(
         );
     }
     let detail = chosen(&rows, active(screen)).map(|row| detail_text(row, clock.offset_secs));
-    let detail = detail.unwrap_or_default();
+    let mut detail = detail.unwrap_or_default();
+    if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.truncated > 0) {
+        detail.insert_str(0, &format!("and {} more\n", snapshot.truncated));
+    }
     screen.detail_lines = detail.lines().count();
     screen.detail_offset = screen.detail_offset.min(
         screen

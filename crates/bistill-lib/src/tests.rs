@@ -1023,6 +1023,16 @@ fn page_body(values: &str, last: &str, next: Option<u64>) -> String {
 
 const EMPTY_PAGE: &str = r#"{"size":0,"isLastPage":true,"values":[]}"#;
 
+fn quiet_enrich(rows: usize) -> Vec<Result<host::Response, host::Error>> {
+    let mut steps = Vec::new();
+    for _ in 0..rows {
+        steps.push(step(200, r#"{"size":0,"isLastPage":true,"values":[]}"#));
+        steps.push(step(200, r#"{"count":0}"#));
+        steps.push(step(200, r#"{"conflicted":false,"canMerge":false}"#));
+    }
+    steps
+}
+
 fn run_list(
     steps: Vec<Result<host::Response, host::Error>>,
 ) -> (Result<Listed, Error>, Vec<String>) {
@@ -1037,14 +1047,19 @@ fn run_list(
 
 #[test]
 fn list_inbox_pages_both_roles_and_round_trips() {
-    let (listed, urls) = run_list(vec![
+    let mut steps = vec![
         step(200, APP),
         step(200, USER_JSON),
         step(200, REVIEWER_PAGE),
         step(200, EMPTY_PAGE),
         step(200, AUTHOR_PAGE),
-    ]);
+    ];
+    steps.extend(quiet_enrich(6));
+    let (listed, urls) = run_list(steps);
     let mut listed = listed.unwrap();
+    assert!(urls.iter().any(|url| {
+        url.contains("/projects/~jcitizen/repos/mine/pull-requests/3/activities?start=0&limit=25")
+    }));
     assert!(urls[2].contains("role=REVIEWER&start=0&limit=25"));
     assert!(urls[3].contains("role=REVIEWER&start=25&limit=25"));
     assert!(urls[4].contains("role=AUTHOR&start=0&limit=25"));
@@ -1124,16 +1139,25 @@ fn list_inbox_retries_lowercase_and_records_the_cap() {
         r#"{{"size":51,"isLastPage":true,"values":[{}]}}"#,
         values.join(",")
     );
-    let (capped, _) = run_list(vec![
+    let mut steps = vec![
         step(200, APP),
         step(200, USER_JSON),
         step(200, &page),
         step(200, EMPTY_PAGE),
-    ]);
+    ];
+    steps.extend(quiet_enrich(50));
+    let (capped, urls) = run_list(steps);
     let capped = capped.unwrap();
     assert_eq!(capped.snapshot.needs_review.len(), 51);
     assert_eq!(capped.snapshot.truncated, 1);
     assert!(capped.snapshot.waiting.is_empty());
+    assert_eq!(
+        urls.iter()
+            .filter(|url| url.contains("/activities"))
+            .count(),
+        50
+    );
+    assert!(urls.iter().all(|url| !url.contains("/pull-requests/51/")));
 }
 
 #[test]
@@ -1162,6 +1186,15 @@ fn list_inbox_stops_on_the_failing_get() {
         step(500, "no"),
     ]);
     assert!(matches!(author_http, Err(Error::Http(500))));
+    let page = page_body(&listed_pr(1, "pat", true, None), "true", None);
+    let (enrich_http, _) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, &page),
+        step(200, EMPTY_PAGE),
+        step(500, "no"),
+    ]);
+    assert!(matches!(enrich_http, Err(Error::Http(500))));
 }
 
 fn authored(id: u64, title: &str, repo: &str, project: &str, updated: u64, extra: &str) -> String {
@@ -1850,4 +1883,362 @@ fn poll_list_keeps_retry_after_on_429() {
         Ok(_) => panic!("429"),
     };
     assert_eq!(err.retry_after_ms, Some(u64::MAX));
+}
+
+const ACTIVITIES: &str = include_str!("../../../fixtures/enrich-activities.json");
+const BUILD_MIXED: &str = include_str!("../../../fixtures/enrich-build.json");
+
+fn listed_pr(id: u64, author: &str, reviewer: bool, commit: Option<&str>) -> String {
+    let commit = match commit {
+        Some(commit) => format!(r#","latestCommit":"{commit}""#),
+        None => String::new(),
+    };
+    let reviewers = if reviewer {
+        r##","reviewers":[{"user":{"displayName":"Jane Citizen","slug":"jcitizen"},"status":"UNAPPROVED"}]"##
+    } else {
+        ""
+    };
+    format!(
+        r##"{{"id":{id},"title":"T{id}","state":"OPEN","createdDate":1,"updatedDate":1,"fromRef":{{"displayId":"f"{commit},"repository":{{"slug":"repo","project":{{"key":"PRJ"}}}}}},"toRef":{{"displayId":"main"}},"author":{{"user":{{"displayName":"{author}","slug":"{author}"}}}}{reviewers}}}"##
+    )
+}
+
+fn scripted(
+    steps: Vec<Result<host::Response, host::Error>>,
+    commit: Option<&str>,
+) -> (Result<crate::enrich::Filled, InboxFault>, Vec<String>) {
+    let mut urls = Vec::new();
+    let mut steps = steps;
+    let result = {
+        let mut get = |path: &str| {
+            urls.push(path.to_owned());
+            match steps.remove(0) {
+                Ok(response) => Ok(response),
+                Err(err) => Err(InboxFault::from(Error::from(err))),
+            }
+        };
+        enrich::fetch(&mut get, "~me", "repo", 9, "pat", "jcitizen", commit)
+    };
+    (result, urls)
+}
+
+fn fault_text(err: InboxFault) -> String {
+    err.error.to_string()
+}
+
+#[test]
+fn list_enriches_threads_tasks_build_and_merge() {
+    let reviewer = page_body(&listed_pr(1, "pat", true, Some("abc")), "true", None);
+    let author = page_body(&listed_pr(2, "jcitizen", false, None), "true", None);
+    let waiting_thread = r#"{"size":1,"isLastPage":true,"values":[{"action":"COMMENTED","comment":{"createdDate":1,"author":{"slug":"sam"},"comments":[]}}]}"#;
+    let (listed, urls) = run_list(vec![
+        step(200, APP),
+        step(200, USER_JSON),
+        step(200, &reviewer),
+        step(200, &author),
+        step(200, ACTIVITIES),
+        step(200, r#"{"count":4}"#),
+        step(200, BUILD_MIXED),
+        step(200, r#"{"conflicted":true,"canMerge":false}"#),
+        step(200, waiting_thread),
+        step(200, r#"{"count":2}"#),
+        step(200, "{}"),
+    ]);
+    let listed = listed.unwrap();
+    let row = &listed.snapshot.needs_review[0];
+    assert_eq!(row.unanswered_as_author, 5);
+    assert_eq!(row.unanswered_as_reviewer, 1);
+    assert_eq!(row.open_tasks, 4);
+    assert_eq!(row.build, Build::Failed);
+    assert!(row.conflicted);
+    assert!(!row.can_merge);
+    let waiting = &listed.snapshot.waiting[0];
+    assert_eq!(waiting.unanswered_as_author, 1);
+    assert_eq!(waiting.unanswered_as_reviewer, 0);
+    assert_eq!(waiting.open_tasks, 2);
+    assert_eq!(waiting.build, Build::None);
+    assert!(!waiting.conflicted);
+    assert!(!waiting.can_merge);
+    assert_eq!(attention_count(&listed.snapshot), 2);
+    assert!(urls.iter().any(|url| url.contains("/commits/abc")));
+    assert!(
+        urls.iter()
+            .any(|url| url.contains("blocker-comments?state=OPEN&count=true"))
+    );
+    let bytes = to_json(&listed.snapshot);
+    let current = parse_snapshot(bytes.as_bytes()).unwrap();
+    let mut previous = parse_snapshot(bytes.as_bytes()).unwrap();
+    previous.needs_review[0].unanswered_as_author = 0;
+    previous.needs_review[0].unanswered_as_reviewer = 0;
+    previous.needs_review[0].open_tasks = 0;
+    previous.needs_review[0].build = Build::None;
+    let changes = diff(Some(&previous), &current);
+    let reasons = &changes
+        .iter()
+        .find(|change| change.id == "PRJ/repo/1")
+        .unwrap()
+        .reasons;
+    assert!(reasons.contains(&Reason::Unanswered));
+    assert!(reasons.contains(&Reason::Tasks));
+    assert!(reasons.contains(&Reason::BuildFailed));
+    let bad = parse_page(
+        br#"{"size":1,"isLastPage":true,"values":[{"id":1,"title":"T","state":"OPEN","createdDate":1,"updatedDate":1,"fromRef":{"displayId":"f","latestCommit":1,"repository":{"slug":"repo","project":{"key":"PRJ"}}},"toRef":{"displayId":"main"},"author":{"user":{"displayName":"Pat","slug":"pat"}}}]}"#,
+    );
+    assert!(bad.unwrap_err().to_string().contains("latestCommit"));
+}
+
+#[test]
+fn enrich_pages_fallbacks_and_rejects_bad_bodies() {
+    let page = r#"{"size":1,"isLastPage":false,"nextPageStart":25,"values":[{"action":"COMMENTED","comment":{"createdDate":1,"author":{"slug":"sam"}}}]}"#;
+    let (filled, urls) = scripted(
+        vec![
+            step(200, page),
+            step(200, r#"{"size":0,"isLastPage":true,"values":[]}"#),
+            step(400, "no"),
+            step(
+                200,
+                r#"{"isLastPage":false,"nextPageStart":25,"values":[{},{}]}"#,
+            ),
+            step(200, r#"{"isLastPage":true,"values":[{}]}"#),
+            step(404, "missing"),
+            step(200, r#"{"canMerge":true}"#),
+        ],
+        Some("abc def"),
+    );
+    let filled = filled.unwrap();
+    let _ = format!("{filled:?}");
+    assert_eq!(filled.unanswered_as_author, 1);
+    assert_eq!(filled.open_tasks, 3);
+    assert_eq!(filled.build, Build::None);
+    assert!(!filled.conflicted);
+    assert!(filled.can_merge);
+    assert!(
+        urls[0].contains("/projects/~me/repos/repo/pull-requests/9/activities?start=0&limit=25")
+    );
+    assert!(urls.iter().any(|url| url.contains("/commits/abc%20def")));
+    assert!(urls.iter().any(|url| url.contains("start=25&limit=25")));
+
+    let (progress, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(200, r#"{"values":[{"state":"RUNNING"}]}"#),
+            step(200, "{}"),
+        ],
+        Some("abc"),
+    );
+    assert_eq!(progress.unwrap().build, Build::InProgress);
+    let (successful, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(200, r#"{"values":[{"status":"SUCCESSFUL"}]}"#),
+            step(200, r#"{"conflicted":true,"canMerge":true}"#),
+        ],
+        Some("abc"),
+    );
+    let successful = successful.unwrap();
+    assert_eq!(successful.build, Build::Successful);
+    assert!(successful.conflicted && successful.can_merge);
+    let (none, urls) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"isLastPage":true,"values":[]}"#),
+            step(200, "{}"),
+        ],
+        None,
+    );
+    assert_eq!(none.unwrap().build, Build::None);
+    assert!(urls.iter().all(|url| !url.contains("build-status")));
+
+    let (held, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(
+                200,
+                r#"{"isLastPage":false,"nextPageStart":25,"values":[{}]}"#,
+            ),
+            step(200, r#"{"isLastPage":true,"values":[{},{}]}"#),
+            step(200, "{}"),
+        ],
+        None,
+    );
+    assert_eq!(held.unwrap().open_tasks, 3);
+
+    let cases = [
+        (
+            vec![step(
+                200,
+                r#"{"isLastPage":false,"nextPageStart":0,"values":[]}"#,
+            )],
+            "nextPageStart",
+        ),
+        (
+            vec![step(200, r#"{"isLastPage":"yes","values":[]}"#)],
+            "isLastPage",
+        ),
+        (
+            vec![step(200, r#"{"isLastPage":true,"values":{}}"#)],
+            "values",
+        ),
+        (vec![step(200, r#"{"isLastPage":true}"#)], "missing values"),
+        (vec![step(200, "{")], "line"),
+        (vec![step(429, "slow")], "HTTP 429"),
+        (vec![step(500, "no")], "HTTP 500"),
+    ];
+    for (steps, needle) in cases {
+        let (err, _) = scripted(steps, None);
+        assert!(fault_text(err.unwrap_err()).contains(needle), "{needle}");
+    }
+    let delayed = Ok(host::Response {
+        status: 429,
+        body: Vec::new(),
+        retry_after: Some(4),
+    });
+    let (err, _) = scripted(vec![delayed], None);
+    let err = err.unwrap_err();
+    assert_eq!(err.retry_after_ms, Some(4_000));
+    let _ = format!("{err:?}");
+    let (err, _) = scripted(
+        vec![Err(host::Error::Timeout {
+            program: "curl".to_owned(),
+        })],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("timed out"));
+
+    let (err, _) = scripted(
+        vec![step(200, EMPTY_PAGE), step(200, r#"{"count":"x"}"#)],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("count"));
+    let (err, _) = scripted(vec![step(200, EMPTY_PAGE), step(500, "no")], None);
+    assert!(fault_text(err.unwrap_err()).contains("HTTP 500"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(400, "no"),
+            step(200, r#"{"isLastPage":false,"values":[]}"#),
+        ],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("nextPageStart"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(400, "no"),
+            step(200, r#"{"isLastPage":false,"nextPageStart":0,"values":[]}"#),
+        ],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("did not advance"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":1}"#),
+            step(200, r#"{"values":[{"state":1}]}"#),
+        ],
+        Some("abc"),
+    );
+    assert!(fault_text(err.unwrap_err()).contains("state"));
+    let (empty_build, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(200, r#"{"values":[]}"#),
+            step(200, "{}"),
+        ],
+        Some("abc"),
+    );
+    assert_eq!(empty_build.unwrap().build, Build::None);
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(500, "no"),
+        ],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("HTTP 500"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(200, r#"{"conflicted":"x"}"#),
+        ],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("conflicted"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(200, r#"{"conflicted":true,"canMerge":"x"}"#),
+        ],
+        None,
+    );
+    assert!(fault_text(err.unwrap_err()).contains("canMerge"));
+    let (err, _) = scripted(
+        vec![
+            step(200, EMPTY_PAGE),
+            step(200, r#"{"count":0}"#),
+            step(500, "no"),
+        ],
+        Some("abc"),
+    );
+    assert!(fault_text(err.unwrap_err()).contains("HTTP 500"));
+}
+
+#[test]
+fn enrich_keeps_the_oldest_fifty() {
+    let needs: Vec<_> = (0..51)
+        .map(|index| finger_row(&format!("p/r/{index}"), index, Vec::new()))
+        .collect();
+    let waiting = vec![finger_row("w/w/1", 5, Vec::new())];
+    let slots = enrich::slots(&needs, &waiting, 50);
+    assert_eq!(slots.len(), 50);
+    assert!(matches!(slots[0], enrich::Slot::Needs(0)));
+    assert!(
+        slots
+            .iter()
+            .all(|slot| !matches!(slot, enrich::Slot::Needs(50)))
+    );
+    let tied = vec![
+        finger_row("a/a/1", 5, Vec::new()),
+        finger_row("b/b/2", 5, Vec::new()),
+        finger_row("c/c/3", 1, Vec::new()),
+    ];
+    let order = enrich::slots(&tied, &waiting, 50);
+    assert!(matches!(order[0], enrich::Slot::Needs(2)));
+    assert!(matches!(order[1], enrich::Slot::Needs(0)));
+    assert!(matches!(order[2], enrich::Slot::Needs(1)));
+    assert!(matches!(order[3], enrich::Slot::Waiting(0)));
+    assert_eq!(
+        enrich::rank_cmp((1, 0, 0), (2, 0, 0)),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        enrich::rank_cmp((2, 0, 0), (1, 0, 0)),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        enrich::rank_cmp((1, 0, 0), (1, 1, 0)),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        enrich::rank_cmp((1, 1, 0), (1, 0, 0)),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        enrich::rank_cmp((1, 0, 0), (1, 0, 1)),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        enrich::rank_cmp((1, 0, 1), (1, 0, 0)),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        enrich::rank_cmp((1, 0, 0), (1, 0, 0)),
+        std::cmp::Ordering::Equal
+    );
 }
