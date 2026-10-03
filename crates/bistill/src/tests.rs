@@ -63,6 +63,8 @@ struct Script {
     report: Option<Result<Report, Error>>,
     listed: Option<Result<Listed, Error>>,
     origin: String,
+    toasts: Vec<host::Toast>,
+    fail_notify: bool,
 }
 
 impl Session for Script {
@@ -80,6 +82,17 @@ impl Session for Script {
         let _ = now_ms;
         self.origin = client.requests()[0].url.clone();
         self.listed.take().expect("list")
+    }
+
+    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
+        self.toasts.push(toast.clone());
+        if self.fail_notify {
+            Err(host::Error::Missing {
+                program: super::notify_bin::PROGRAM.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -109,6 +122,8 @@ fn ready(report: Result<Report, Error>) -> Script {
         report: Some(report),
         listed: None,
         origin: String::new(),
+        toasts: Vec::new(),
+        fail_notify: false,
     }
 }
 
@@ -384,6 +399,8 @@ fn ready_version(err: Result<String, Error>) -> Script {
         report: None,
         listed: None,
         origin: String::new(),
+        toasts: Vec::new(),
+        fail_notify: false,
     }
 }
 
@@ -545,6 +562,8 @@ fn listed_script(listed: Result<Listed, Error>) -> Script {
         report: None,
         listed: Some(listed),
         origin: String::new(),
+        toasts: Vec::new(),
+        fail_notify: false,
     }
 }
 
@@ -689,6 +708,34 @@ fn ls_refuses_a_file_as_state_dir() {
     fs::remove_dir_all(&cwd).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn ls_refuses_a_read_only_state_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = temp("ls-ro-state");
+    let dir = cwd.join("state");
+    fs::create_dir(&dir).unwrap();
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!("state_dir = {}\n", dir.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, stdout, stderr, _) = run(
+        &["ls"],
+        &cwd,
+        &env_token(),
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: Vec::new(),
+        })),
+    );
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stdout.is_empty());
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
 #[test]
 fn ls_empty_is_success_and_verbose_redacts() {
     let cwd = temp("ls-empty");
@@ -785,4 +832,194 @@ fn live_list_reads_http_status() {
     assert!(matches!(err, Error::Http(500)), "{err}");
     thread.join().expect("server");
     fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn ls_notifies_each_change_and_logs_a_missing_notifier_once() {
+    let cwd = temp("notify");
+    let env = env_token();
+    let rows = || {
+        sample_snapshot(
+            vec![sample_row(
+                "PRJ",
+                "repo",
+                12,
+                "Fix the pipe",
+                false,
+                false,
+                false,
+            )],
+            vec![sample_row(
+                "PRJ",
+                "pipe",
+                21,
+                "Waiting on Sam",
+                false,
+                true,
+                true,
+            )],
+        )
+    };
+    let mut script = listed_script(Ok(Listed {
+        snapshot: rows(),
+        requests: Vec::new(),
+    }));
+    script.fail_notify = true;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["ls"]),
+        &cwd,
+        &env,
+        &mut stdout,
+        &mut stderr,
+        &mut script,
+    );
+    let err = String::from_utf8(stderr).unwrap();
+    let out = String::from_utf8(stdout).unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Needs review"));
+    assert_eq!(script.toasts.len(), 2);
+    let program = super::notify_bin::PROGRAM;
+    assert_eq!(
+        err.matches(&format!("{program} must be on PATH.")).count(),
+        1
+    );
+    assert_toast(
+        &script.toasts[0],
+        "PRJ/repo#12 needs review\nhttps://git.example.invalid/pull/12",
+    );
+    assert_toast(
+        &script.toasts[1],
+        "PRJ/pipe#21 waiting\nhttps://git.example.invalid/pull/21",
+    );
+
+    let mut quiet = listed_script(Ok(Listed {
+        snapshot: rows(),
+        requests: Vec::new(),
+    }));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["ls"]),
+        &cwd,
+        &env,
+        &mut stdout,
+        &mut stderr,
+        &mut quiet,
+    );
+    assert_eq!(code, 0);
+    assert!(quiet.toasts.is_empty());
+    assert!(String::from_utf8(stderr).unwrap().is_empty());
+
+    let mut gone = listed_script(Ok(Listed {
+        snapshot: sample_snapshot(
+            vec![sample_row(
+                "PRJ",
+                "repo",
+                12,
+                "Fix the pipe",
+                false,
+                false,
+                false,
+            )],
+            Vec::new(),
+        ),
+        requests: Vec::new(),
+    }));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["ls"]),
+        &cwd,
+        &env,
+        &mut stdout,
+        &mut stderr,
+        &mut gone,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(gone.toasts.len(), 1);
+    assert_toast(
+        &gone.toasts[0],
+        "PRJ/pipe#21 merged or declined\nhttps://git.example.invalid/pull/21",
+    );
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+fn assert_toast(toast: &host::Toast, body: &str) {
+    let args = host::toast_arguments(toast);
+    let text = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains(body), "{text}");
+    #[cfg(unix)]
+    {
+        match toast {
+            host::Toast::NotifySend {
+                program,
+                title,
+                expire,
+                ..
+            } => {
+                assert_eq!(program, "notify-send");
+                assert_eq!(title, "Bistill");
+                assert_eq!(*expire, Some(Duration::from_millis(10_000)));
+            }
+            host::Toast::PowerShell { .. } => panic!("linux toast is notify-send"),
+        }
+        assert!(text.contains("--expire-time"));
+        assert!(text.contains("10000"));
+    }
+    #[cfg(windows)]
+    {
+        match toast {
+            host::Toast::PowerShell {
+                program,
+                title,
+                url,
+                ..
+            } => {
+                assert_eq!(program, "powershell.exe");
+                assert_eq!(title, "Bistill");
+                assert_eq!(url.as_deref(), Some(body.lines().nth(1).unwrap()));
+            }
+            host::Toast::NotifySend { .. } => panic!("windows toast is powershell"),
+        }
+    }
+}
+
+#[test]
+fn ls_refuses_a_corrupt_snapshot() {
+    let cwd = temp("corrupt-snapshot");
+    fs::write(cwd.join("snapshot.json"), "{").unwrap();
+    let (code, stdout, stderr, _) = run(
+        &["ls"],
+        &cwd,
+        &env_token(),
+        listed_script(Ok(Listed {
+            snapshot: sample_snapshot(Vec::new(), Vec::new()),
+            requests: Vec::new(),
+        })),
+    );
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stdout.is_empty());
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn live_notify_reports_a_missing_program() {
+    let toast = host::Toast::NotifySend {
+        program: "bistill-missing-notify".to_owned(),
+        title: "Bistill".to_owned(),
+        body: "body".to_owned(),
+        expire: None,
+        timeout: Duration::from_secs(1),
+    };
+    let err = Live.notify(&toast).unwrap_err();
+    assert!(matches!(
+        err,
+        host::Error::Missing { program } if program == "bistill-missing-notify"
+    ));
 }
