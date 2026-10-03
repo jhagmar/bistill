@@ -495,3 +495,275 @@ fn debug_names_each_event_variant() {
     assert_eq!(backend, backend.clone());
     assert!(!format!("{backend:?}").is_empty());
 }
+
+fn row_text(buffer: &Buffer, x: u16, y: u16, width: u16) -> String {
+    let mut text = String::new();
+    for column in x..x + width {
+        text.push_str(&symbol(buffer, column, y));
+    }
+    text
+}
+
+fn symbol(buffer: &Buffer, x: u16, y: u16) -> String {
+    match &buffer.get(x, y).unwrap().glyph {
+        Glyph::Single(text) | Glyph::Wide(text) => text.clone(),
+        Glyph::Tail => String::new(),
+    }
+}
+
+fn rect(x: u16, y: u16, width: u16, height: u16) -> Rect {
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+#[test]
+fn block_draws_a_focused_border_and_title() {
+    let mut buffer = Buffer::empty(10, 4);
+    let plain = Style::default();
+    let focused = Style {
+        bold: true,
+        ..Style::default()
+    };
+    draw_block(
+        &mut buffer,
+        rect(0, 0, 10, 4),
+        "Needs review",
+        false,
+        plain,
+        focused,
+    );
+    assert_eq!(symbol(&buffer, 0, 0), "+");
+    assert_eq!(row_text(&buffer, 1, 0, 8), "Needs r…");
+    assert!(!buffer.get(0, 1).unwrap().style.bold);
+    assert_eq!(symbol(&buffer, 0, 1), "|");
+    draw_block(
+        &mut buffer,
+        rect(0, 0, 10, 4),
+        "Title",
+        true,
+        plain,
+        focused,
+    );
+    assert!(buffer.get(0, 0).unwrap().style.bold);
+    assert_eq!(row_text(&buffer, 1, 0, 5), "Title");
+    draw_block(
+        &mut buffer,
+        rect(0, 0, 8, 2),
+        "Too long title",
+        false,
+        plain,
+        focused,
+    );
+    assert_eq!(row_text(&buffer, 1, 0, 6), "Too l…");
+    assert_eq!(symbol(&buffer, 0, 1), "+");
+    draw_block(&mut buffer, rect(0, 0, 1, 4), "x", false, plain, focused);
+    let inside = inner(rect(2, 3, 6, 4));
+    assert_eq!(inside, rect(3, 4, 4, 2));
+    assert_eq!(inner(rect(0, 0, 1, 4)).width, 0);
+}
+
+#[test]
+fn table_selects_a_row_and_hit_testing_names_it() {
+    let mut buffer = Buffer::empty(24, 8);
+    let parts = split(
+        rect(0, 0, 24, 8),
+        Direction::Vertical,
+        &[Constraint::Min(4), Constraint::Fixed(1)],
+    );
+    let body = parts[0];
+    let mut state = ListState::new();
+    state.selected = Some(1);
+    state.offset = 0;
+    state.reveal(3, usize::from(body.height.saturating_sub(1)));
+    let rows = [
+        ["PRJ/repo#12", "Fix"].as_slice(),
+        ["PRJ/repo#13", "Draft"].as_slice(),
+        ["PRJ/pipe#21", "Wait"].as_slice(),
+    ];
+    let plain = Style::default();
+    let selected = Style {
+        reverse: true,
+        ..Style::default()
+    };
+    draw_table(&mut buffer, body, &rows, &[12, 6], &state, plain, selected);
+    assert_eq!(symbol(&buffer, body.x, body.y + 1), "P");
+    assert!(buffer.get(body.x, body.y + 1).unwrap().style.reverse);
+    assert!(!buffer.get(body.x, body.y).unwrap().style.reverse);
+    assert_eq!(symbol(&buffer, body.x + 13, body.y), "F");
+    let label_y = body.y + body.height - 1;
+    assert_eq!(symbol(&buffer, body.x, label_y), "2");
+    assert_eq!(
+        hit_row(body, state.offset, rows.len(), body.x, body.y + 1),
+        Some(1)
+    );
+    assert_eq!(
+        hit_row(body, state.offset, rows.len(), body.x, label_y),
+        None
+    );
+    assert_eq!(hit_row(body, state.offset, rows.len(), 0, 100), None);
+    assert_eq!(hit_row(body, 0, rows.len(), body.x, body.y + 4), None);
+    assert_eq!(position(Some(1), 3), "2/3");
+    assert_eq!(position(None, 3), "0/3");
+    assert_eq!(position(Some(9), 3), "0/3");
+    let mut scrolled = ListState {
+        selected: Some(2),
+        offset: 0,
+    };
+    scrolled.reveal(3, 1);
+    assert_eq!(scrolled.offset, 2);
+    assert_eq!(ensure_visible(Some(0), 10, 3, 4), 0);
+    assert_eq!(ensure_visible(Some(5), 10, 3, 0), 3);
+    assert_eq!(ensure_visible(Some(1), 10, 3, 0), 0);
+    assert_eq!(ensure_visible(None, 10, 3, 2), 2);
+    assert_eq!(ensure_visible(Some(4), 3, 0, 9), 3);
+    let mut list_buffer = Buffer::empty(8, 3);
+    let mut list = ListState {
+        selected: Some(1),
+        offset: 1,
+    };
+    draw_list(
+        &mut list_buffer,
+        rect(0, 0, 8, 3),
+        &["one", "two", "three"],
+        &list,
+        plain,
+        selected,
+    );
+    assert_eq!(symbol(&list_buffer, 0, 0), "t");
+    assert!(list_buffer.get(0, 0).unwrap().style.reverse);
+    assert_eq!(symbol(&list_buffer, 0, 2), "2");
+    list.offset = 5;
+    draw_list(
+        &mut list_buffer,
+        rect(0, 0, 4, 1),
+        &["abcdef"],
+        &list,
+        plain,
+        selected,
+    );
+    assert_eq!(symbol(&list_buffer, 0, 0), "0");
+    draw_list(
+        &mut list_buffer,
+        rect(0, 0, 0, 0),
+        &["a"],
+        &ListState::new(),
+        plain,
+        selected,
+    );
+    let mut wide = Buffer::empty(6, 3);
+    draw_table(
+        &mut wide,
+        rect(0, 0, 3, 3),
+        &[&["abcdef", "z"]],
+        &[4],
+        &ListState {
+            selected: None,
+            offset: 0,
+        },
+        plain,
+        selected,
+    );
+    assert_eq!(symbol(&wide, 0, 0), "a");
+    draw_table(
+        &mut wide,
+        rect(0, 0, 6, 3),
+        &[&["ab", "cd", "ef"]],
+        &[2, 2],
+        &ListState::new(),
+        plain,
+        selected,
+    );
+    assert_eq!(symbol(&wide, 3, 0), "c");
+    draw_table(
+        &mut wide,
+        rect(0, 0, 6, 3),
+        &[&["ab", "cd"]],
+        &[2],
+        &ListState::new(),
+        plain,
+        selected,
+    );
+}
+
+#[test]
+fn paragraph_tabs_and_input_edit_the_line() {
+    let mut buffer = Buffer::empty(12, 6);
+    let plain = Style::default();
+    draw_paragraph(&mut buffer, rect(0, 0, 5, 3), "hello world", plain);
+    assert_eq!(symbol(&buffer, 0, 0), "h");
+    assert_eq!(symbol(&buffer, 0, 1), "w");
+    draw_paragraph(&mut buffer, rect(0, 0, 3, 2), "abcdef", plain);
+    assert_eq!(symbol(&buffer, 0, 0), "a");
+    assert_eq!(symbol(&buffer, 0, 1), "d");
+    draw_paragraph(&mut buffer, rect(0, 0, 4, 3), "hi\nthere", plain);
+    assert_eq!(symbol(&buffer, 0, 1), "t");
+    draw_paragraph(&mut buffer, rect(0, 0, 1, 2), "あa", plain);
+    draw_paragraph(&mut buffer, rect(0, 0, 5, 1), "one two three", plain);
+    draw_paragraph(&mut buffer, rect(0, 0, 0, 2), "x", plain);
+    draw_paragraph(&mut buffer, rect(0, 0, 4, 2), "\n", plain);
+    let selected = Style {
+        bold: true,
+        ..Style::default()
+    };
+    draw_tabs(
+        &mut buffer,
+        rect(0, 3, 12, 1),
+        &["One", "Two"],
+        1,
+        plain,
+        selected,
+    );
+    assert_eq!(symbol(&buffer, 0, 3), "O");
+    assert!(!buffer.get(0, 3).unwrap().style.bold);
+    assert_eq!(symbol(&buffer, 3, 3), "|");
+    assert_eq!(symbol(&buffer, 4, 3), "T");
+    assert!(buffer.get(4, 3).unwrap().style.bold);
+    draw_tabs(
+        &mut buffer,
+        rect(0, 3, 1, 1),
+        &["ab", "cd"],
+        0,
+        plain,
+        selected,
+    );
+    draw_tabs(&mut buffer, rect(0, 3, 4, 0), &["ab"], 0, plain, selected);
+    draw_tabs(&mut buffer, rect(0, 3, 4, 1), &[], 0, plain, selected);
+    let mut input = Input::default();
+    assert_eq!(input, Input::new());
+    assert!(format!("{input:?}").contains("cursor"));
+    input.insert('a');
+    input.insert('あ');
+    input.insert('b');
+    assert_eq!(input.value, "aあb");
+    assert_eq!(input.cursor, 3);
+    input.backspace();
+    assert_eq!(input.value, "aあ");
+    assert_eq!(input.cursor, 2);
+    input.cursor = 0;
+    input.backspace();
+    assert_eq!(input.cursor, 0);
+    input.click(rect(0, 4, 6, 1), 1, 4);
+    assert_eq!(input.cursor, 1);
+    input.click(rect(0, 4, 6, 1), 5, 4);
+    assert_eq!(input.cursor, 2);
+    input.click(rect(0, 4, 6, 1), 0, 3);
+    assert_eq!(input.cursor, 2);
+    input.click(rect(0, 4, 0, 1), 0, 4);
+    draw_input(&mut buffer, rect(0, 4, 6, 1), &input, plain);
+    assert!(buffer.get(3, 4).unwrap().style.reverse);
+    input.value = "abcdef".to_owned();
+    input.cursor = 6;
+    draw_input(&mut buffer, rect(0, 5, 3, 1), &input, plain);
+    assert_eq!(symbol(&buffer, 0, 5), "e");
+    assert!(buffer.get(2, 5).unwrap().style.reverse);
+    buffer.set_style(20, 20, plain);
+    draw_input(&mut buffer, rect(0, 0, 0, 1), &input, plain);
+    let state = ListState::default();
+    assert_eq!(state, ListState::new());
+    assert!(format!("{state:?}").contains("offset"));
+    assert_eq!(state.selected, None);
+}
