@@ -9,13 +9,22 @@ mod backend;
 mod buffer;
 mod layout;
 mod style;
+mod terminal;
 mod widgets;
 mod width;
+
+#[cfg(unix)]
+#[path = "terminal_unix.rs"]
+mod terminal_os;
+#[cfg(windows)]
+#[path = "terminal_windows.rs"]
+mod terminal_os;
 
 pub use backend::{Backend, Event, KeyCode, MouseButton, TestBackend, Wheel};
 pub use buffer::{Buffer, Cell, Glyph, Line, Span};
 pub use layout::{Constraint, Direction, Rect, split};
 pub use style::{Color, Style};
+pub use terminal::Terminal;
 pub use widgets::{
     Input, ListState, draw_block, draw_input, draw_list, draw_paragraph, draw_table, draw_tabs,
     ensure_visible, hit_row, inner, position,

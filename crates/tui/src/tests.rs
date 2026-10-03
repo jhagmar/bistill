@@ -767,3 +767,484 @@ fn paragraph_tabs_and_input_edit_the_line() {
     assert!(format!("{state:?}").contains("offset"));
     assert_eq!(state.selected, None);
 }
+
+fn plain_span(content: &str) -> Span<'_> {
+    Span {
+        style: Style::default(),
+        content,
+    }
+}
+
+#[test]
+fn paint_writes_changed_cells_and_skips_the_rest() {
+    let previous = Buffer::empty(4, 1);
+    let mut next = Buffer::empty(4, 1);
+    next.set_span(0, 0, &plain_span("AB"), 4);
+    next.set_span(
+        3,
+        0,
+        &Span {
+            style: Style {
+                bold: true,
+                ..Style::default()
+            },
+            content: "C",
+        },
+        1,
+    );
+    let text = String::from_utf8(crate::terminal::paint(&previous, &next)).unwrap();
+    assert!(text.contains("\u{1b}[1;1H"));
+    assert!(text.contains("\u{1b}[0;39;49mAB"));
+    assert!(text.contains("\u{1b}[1;4H"));
+    assert!(text.contains("\u{1b}[0;1;39;49mC"));
+    assert!(!text.contains("\u{1b}[2J"));
+    assert!(crate::terminal::paint(&next, &next).is_empty());
+
+    let mut marked = next.clone();
+    marked.set_style(
+        0,
+        0,
+        Style {
+            underline: true,
+            reverse: true,
+            fg: Some(Color::Red),
+            bg: Some(Color::Blue),
+            ..Style::default()
+        },
+    );
+    let marked_text = String::from_utf8(crate::terminal::paint(&next, &marked)).unwrap();
+    assert!(marked_text.contains(";4;7;31;44m"));
+
+    let mut colors = Buffer::empty(16, 2);
+    for (index, color) in Color::ALL.iter().enumerate() {
+        let column = u16::try_from(index).unwrap();
+        colors.set_span(
+            column,
+            0,
+            &Span {
+                style: Style {
+                    fg: Some(*color),
+                    ..Style::default()
+                },
+                content: "x",
+            },
+            1,
+        );
+        colors.set_span(
+            column,
+            1,
+            &Span {
+                style: Style {
+                    bg: Some(*color),
+                    ..Style::default()
+                },
+                content: "y",
+            },
+            1,
+        );
+    }
+    let colored =
+        String::from_utf8(crate::terminal::paint(&Buffer::empty(16, 2), &colors)).unwrap();
+    assert!(colored.contains(";30;"));
+    assert!(colored.contains(";97;"));
+    assert!(colored.contains(";40m"));
+    assert!(colored.contains(";107m"));
+
+    let mut wide = Buffer::empty(4, 1);
+    wide.set_span(0, 0, &plain_span("あ"), 4);
+    let wide_bytes = crate::terminal::paint(&Buffer::empty(4, 1), &wide);
+    assert_eq!(
+        wide_bytes
+            .windows("あ".len())
+            .filter(|window| *window == "あ".as_bytes())
+            .count(),
+        1
+    );
+    assert!(crate::terminal::paint(&wide, &wide).is_empty());
+    let mut tail = wide.clone();
+    tail.set_style(
+        1,
+        0,
+        Style {
+            bold: true,
+            ..Style::default()
+        },
+    );
+    let tail_bytes = crate::terminal::paint(&wide, &tail);
+    assert!(
+        tail_bytes
+            .windows("あ".len())
+            .any(|window| window == "あ".as_bytes())
+    );
+    let mut replaced = Buffer::empty(4, 1);
+    replaced.set_span(0, 0, &plain_span("い"), 4);
+    let replaced_bytes = crate::terminal::paint(&wide, &replaced);
+    assert!(
+        replaced_bytes
+            .windows("い".len())
+            .any(|window| window == "い".as_bytes())
+    );
+
+    assert_eq!(
+        crate::terminal::paint(&Buffer::empty(2, 2), &Buffer::empty(0, 1)),
+        b"\x1b[2J"
+    );
+    assert!(crate::terminal::paint(&Buffer::empty(0, 0), &Buffer::empty(0, 0)).is_empty());
+}
+
+fn decode_one(bytes: &[u8], flushed: bool) -> (Option<Event>, Vec<u8>) {
+    let mut pending = bytes.to_vec();
+    let event = crate::terminal::decode(&mut pending, flushed);
+    (event, pending)
+}
+
+fn mouse(body: &str, kind: u8) -> Option<Event> {
+    let mut bytes = b"\x1b[<".to_vec();
+    bytes.extend(body.as_bytes());
+    bytes.push(kind);
+    let (event, rest) = decode_one(&bytes, false);
+    assert!(rest.is_empty());
+    event
+}
+
+#[test]
+fn decode_reads_keys_and_sgr_mouse() {
+    let (event, rest) = decode_one(b"", false);
+    assert_eq!(event, None);
+    assert!(rest.is_empty());
+    let mut pending = b"ab".to_vec();
+    assert_eq!(
+        crate::terminal::decode(&mut pending, false),
+        Some(Event::Key(KeyCode::Char('a')))
+    );
+    assert_eq!(
+        crate::terminal::decode(&mut pending, false),
+        Some(Event::Key(KeyCode::Char('b')))
+    );
+    assert_eq!(crate::terminal::decode(&mut pending, true), None);
+
+    assert_eq!(decode_one(b"\r", false).0, Some(Event::Key(KeyCode::Enter)));
+    assert_eq!(decode_one(b"\n", false).0, Some(Event::Key(KeyCode::Enter)));
+    assert_eq!(decode_one(b"\t", false).0, Some(Event::Key(KeyCode::Tab)));
+    assert_eq!(
+        decode_one(b"\x08", false).0,
+        Some(Event::Key(KeyCode::Backspace))
+    );
+    assert_eq!(
+        decode_one(&[0x7f], false).0,
+        Some(Event::Key(KeyCode::Backspace))
+    );
+    assert_eq!(decode_one(&[0x01], false), (None, Vec::new()));
+    assert_eq!(
+        decode_one("ä".as_bytes(), false).0,
+        Some(Event::Key(KeyCode::Char('ä')))
+    );
+    assert_eq!(
+        decode_one("あ".as_bytes(), false).0,
+        Some(Event::Key(KeyCode::Char('あ')))
+    );
+    assert_eq!(
+        decode_one("😀".as_bytes(), false).0,
+        Some(Event::Key(KeyCode::Char('😀')))
+    );
+    let (event, rest) = decode_one(&[0xc3], false);
+    assert_eq!(event, None);
+    assert_eq!(rest, vec![0xc3]);
+    assert_eq!(decode_one(&[0xc3], true), (None, Vec::new()));
+    let (event, rest) = decode_one(&[0xff, 0xff, 0xff, 0xff], false);
+    assert_eq!(event, None);
+    assert_eq!(rest.len(), 3);
+    let (event, rest) = decode_one(&[0x80, 0x80], false);
+    assert_eq!(event, None);
+    assert_eq!(rest, vec![0x80]);
+
+    let (event, rest) = decode_one(b"\x1b", false);
+    assert_eq!(event, None);
+    assert_eq!(rest, b"\x1b");
+    assert_eq!(decode_one(b"\x1b", true).0, Some(Event::Key(KeyCode::Esc)));
+    let (event, rest) = decode_one(b"\x1bx", false);
+    assert_eq!(event, Some(Event::Key(KeyCode::Esc)));
+    assert_eq!(rest, b"x");
+    assert_eq!(decode_one(b"\x1b[", false).0, None);
+    let (event, rest) = decode_one(b"\x1b[", true);
+    assert_eq!(event, Some(Event::Key(KeyCode::Esc)));
+    assert_eq!(rest, b"[");
+    assert_eq!(decode_one(b"\x1bO", false).0, None);
+    let (event, rest) = decode_one(b"\x1bO", true);
+    assert_eq!(event, Some(Event::Key(KeyCode::Esc)));
+    assert_eq!(rest, b"O");
+    assert_eq!(
+        decode_one(b"\x1b[A", false).0,
+        Some(Event::Key(KeyCode::Up))
+    );
+    assert_eq!(
+        decode_one(b"\x1b[B", false).0,
+        Some(Event::Key(KeyCode::Down))
+    );
+    assert_eq!(
+        decode_one(b"\x1b[C", false).0,
+        Some(Event::Key(KeyCode::Right))
+    );
+    assert_eq!(
+        decode_one(b"\x1b[D", false).0,
+        Some(Event::Key(KeyCode::Left))
+    );
+    assert_eq!(
+        decode_one(b"\x1bOA", false).0,
+        Some(Event::Key(KeyCode::Up))
+    );
+    assert_eq!(decode_one(b"\x1bOP", false), (None, Vec::new()));
+    assert_eq!(decode_one(b"\x1b[Z", false), (None, Vec::new()));
+    assert_eq!(decode_one(b"\x1b[15~", false), (None, Vec::new()));
+    assert_eq!(decode_one(b"\x1b[<0;1", false).0, None);
+    let (event, rest) = decode_one(b"\x1b[<0;1", true);
+    assert_eq!(event, Some(Event::Key(KeyCode::Esc)));
+    assert_eq!(rest, b"[<0;1");
+
+    assert_eq!(
+        mouse("0;1;1", b'M'),
+        Some(Event::Press {
+            button: MouseButton::Left,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("0;2;3", b'M'),
+        Some(Event::Press {
+            button: MouseButton::Left,
+            column: 1,
+            row: 2,
+        })
+    );
+    assert_eq!(
+        mouse("1;1;1", b'M'),
+        Some(Event::Press {
+            button: MouseButton::Middle,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("2;1;1", b'M'),
+        Some(Event::Press {
+            button: MouseButton::Right,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("0;1;1", b'm'),
+        Some(Event::Release {
+            button: MouseButton::Left,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("1;1;1", b'm'),
+        Some(Event::Release {
+            button: MouseButton::Middle,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("2;1;1", b'm'),
+        Some(Event::Release {
+            button: MouseButton::Right,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(
+        mouse("64;4;5", b'M'),
+        Some(Event::Wheel {
+            direction: Wheel::Up,
+            column: 3,
+            row: 4,
+        })
+    );
+    assert_eq!(
+        mouse("65;1;1", b'M'),
+        Some(Event::Wheel {
+            direction: Wheel::Down,
+            column: 0,
+            row: 0,
+        })
+    );
+    assert_eq!(mouse("9;1;1", b'M'), None);
+    assert_eq!(mouse("64;1;1", b'm'), None);
+    assert_eq!(mouse("0;1;1;2", b'M'), None);
+    assert_eq!(mouse("x;1;1", b'M'), None);
+    assert_eq!(mouse("0;1", b'M'), None);
+    assert_eq!(mouse("", b'M'), None);
+    let mut bad = b"\x1b[<\xff;1;1M".to_vec();
+    assert_eq!(crate::terminal::decode(&mut bad, false), None);
+    assert!(bad.is_empty());
+}
+
+#[cfg(unix)]
+fn contains_sequence(bytes: &[u8], sequence: &[u8]) -> bool {
+    bytes
+        .windows(sequence.len())
+        .any(|window| window == sequence)
+}
+
+#[cfg(unix)]
+#[test]
+fn stdio_refuses_a_redirected_stream() {
+    use std::io::IsTerminal;
+    assert!(!std::io::stdin().is_terminal());
+    assert!(!std::io::stdout().is_terminal());
+    match Terminal::stdio() {
+        Ok(terminal) => drop(terminal),
+        Err(err) => assert_eq!(err.raw_os_error(), Some(25)),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_restores_the_screen_on_drop_and_panic() {
+    use crate::terminal::{ENTER, LEAVE};
+    use crate::terminal_os::{
+        ICANON, dup_fd, is_armed, local_flags, open_noctty, open_pty, poll_millis, pty_number,
+        read_available, read_count, set_blank_termios, set_winsize, unlock_pty, window_size,
+    };
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::panic::{AssertUnwindSafe, catch_unwind, set_hook, take_hook};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static PROBE: AtomicBool = AtomicBool::new(false);
+
+    crate::terminal::remove_hook();
+    let mut buf = [0; 8];
+    let mut comm = File::open("/proc/self/comm").unwrap();
+    assert!(local_flags(&comm).is_err());
+    assert!(set_blank_termios(&comm).is_err());
+    assert!(window_size(comm.as_raw_fd()).is_err());
+    assert!(set_winsize(&comm, 20, 10).is_err());
+    assert!(unlock_pty(comm.as_raw_fd()).is_err());
+    assert!(pty_number(comm.as_raw_fd()).is_err());
+    assert!(open_noctty("/no/such/bistill-pty").is_err());
+    assert!(dup_fd(-1).is_err());
+    drop(dup_fd(0).unwrap());
+    assert_eq!(poll_millis(Duration::from_millis(15)), 15);
+    assert_eq!(poll_millis(Duration::from_millis(u64::MAX)), i32::MAX);
+    assert!(read_count(&mut comm, &mut buf) > 0);
+    let mut null = File::open("/dev/null").unwrap();
+    assert_eq!(read_count(&mut null, &mut buf), 0);
+    let mut dir = File::open(".").unwrap();
+    assert_eq!(read_count(&mut dir, &mut buf), 0);
+    assert!(read_available(&mut null, Duration::from_millis(20)).is_empty());
+
+    let (mut master, slave) = open_pty().unwrap();
+    assert!(read_available(&mut master, Duration::from_millis(20)).is_empty());
+    set_winsize(&master, 20, 10).unwrap();
+    let probe = slave.try_clone().unwrap();
+    let before = local_flags(&probe).unwrap();
+    assert_ne!(before & ICANON, 0);
+    let input = slave.try_clone().unwrap();
+    let mut terminal = Terminal::pair(input, slave).unwrap();
+    assert!(is_armed());
+    let area = terminal.size();
+    assert_eq!(area.width, 20);
+    assert_eq!(area.height, 10);
+    let entered = read_available(&mut master, Duration::from_millis(200));
+    assert!(contains_sequence(&entered, ENTER));
+    assert_eq!(local_flags(&probe).unwrap() & ICANON, 0);
+
+    let mut buffer = Buffer::empty(20, 10);
+    buffer.set_span(
+        0,
+        0,
+        &Span {
+            style: Style {
+                fg: Some(Color::Red),
+                bold: true,
+                ..Style::default()
+            },
+            content: "Hi",
+        },
+        20,
+    );
+    terminal.draw(&buffer);
+    let drawn = read_available(&mut master, Duration::from_millis(200));
+    assert!(drawn.windows(2).any(|window| window == b"Hi"));
+    terminal.draw(&buffer);
+    assert!(read_available(&mut master, Duration::from_millis(40)).is_empty());
+    assert!(terminal.poll(Duration::from_millis(30)).is_none());
+    master.write_all(b"ab").unwrap();
+    assert_eq!(
+        terminal.poll(Duration::from_millis(200)),
+        Some(Event::Key(KeyCode::Char('a')))
+    );
+    assert_eq!(
+        terminal.poll(Duration::from_millis(30)),
+        Some(Event::Key(KeyCode::Char('b')))
+    );
+    master.write_all(b"\x1b").unwrap();
+    assert!(terminal.poll(Duration::from_millis(50)).is_none());
+    assert_eq!(
+        terminal.poll(Duration::from_millis(50)),
+        Some(Event::Key(KeyCode::Esc))
+    );
+    master.write_all(b"\x1b[A\x1b[<0;2;3M").unwrap();
+    assert_eq!(
+        terminal.poll(Duration::from_millis(200)),
+        Some(Event::Key(KeyCode::Up))
+    );
+    assert_eq!(
+        terminal.poll(Duration::from_millis(50)),
+        Some(Event::Press {
+            button: MouseButton::Left,
+            column: 1,
+            row: 2,
+        })
+    );
+    set_winsize(&master, 30, 12).unwrap();
+    assert_eq!(
+        terminal.poll(Duration::from_millis(50)),
+        Some(Event::Resize {
+            width: 30,
+            height: 12,
+        })
+    );
+    drop(terminal);
+    assert!(!is_armed());
+    let left = read_available(&mut master, Duration::from_millis(200));
+    assert!(contains_sequence(&left, LEAVE));
+    assert_eq!(local_flags(&probe).unwrap(), before);
+
+    let (master_closed, slave_closed) = open_pty().unwrap();
+    let mut hung = Terminal::pair(slave_closed.try_clone().unwrap(), slave_closed).unwrap();
+    drop(master_closed);
+    assert!(hung.poll(Duration::from_millis(50)).is_none());
+    drop(hung);
+
+    struct ResetHook;
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                let _ = take_hook();
+            }
+        }
+    }
+    let _reset = ResetHook;
+    PROBE.store(false, Ordering::SeqCst);
+    set_hook(Box::new(|_| {
+        PROBE.store(!is_armed(), Ordering::SeqCst);
+    }));
+    let (mut panic_master, panic_slave) = open_pty().unwrap();
+    let panic_output = panic_slave.try_clone().unwrap();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _terminal = Terminal::pair(panic_slave, panic_output).unwrap();
+        panic!("restore");
+    }));
+    assert!(result.is_err());
+    assert!(PROBE.load(Ordering::SeqCst));
+    let restored = read_available(&mut panic_master, Duration::from_millis(200));
+    assert!(contains_sequence(&restored, LEAVE));
+}
