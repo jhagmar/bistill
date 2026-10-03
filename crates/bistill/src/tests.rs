@@ -2475,3 +2475,458 @@ fn watch_reports_config_and_lock_errors() {
     assert_eq!(code, 0, "{}", String::from_utf8(stderr).unwrap());
     fs::remove_dir_all(&cwd).unwrap();
 }
+
+struct Inbox {
+    steps: Vec<Result<Listed, bistill_lib::InboxFault>>,
+    now: u64,
+    jump: u64,
+    polls: u32,
+    stop_after: u32,
+    forever: bool,
+    barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    waited: bool,
+}
+
+impl Session for Inbox {
+    fn version(&mut self, _: &str) -> Result<String, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn ping(&mut self, _: &Client) -> Result<Report, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn list(&mut self, _: &Client, _: u64) -> Result<Listed, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn notify(&mut self, _: &host::Toast) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn poll(&mut self, _: &Client, _: u64) -> Result<Listed, bistill_lib::InboxFault> {
+        self.polls += 1;
+        if let Some(barrier) = &self.barrier {
+            if !self.waited {
+                self.waited = true;
+                barrier.wait();
+            }
+        }
+        self.steps.remove(0)
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.now
+    }
+
+    fn pause(&mut self, _: Duration) {
+        self.now += self.jump;
+        std::thread::yield_now();
+    }
+
+    fn again(&mut self) -> bool {
+        self.forever || self.polls < self.stop_after
+    }
+}
+
+fn feed(steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Inbox {
+    let stop_after = steps.len() as u32;
+    Inbox {
+        steps,
+        now: 1_000_000,
+        jump: 20_000,
+        polls: 0,
+        stop_after,
+        forever: false,
+        barrier: None,
+        waited: false,
+    }
+}
+
+enum DriveStep {
+    Until(String),
+    Run(Box<dyn FnMut()>),
+    Event(tui::Event),
+}
+
+struct Drive {
+    grid: tui::TestBackend,
+    barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    fetch_seen: bool,
+    queue: std::collections::VecDeque<DriveStep>,
+    spins: u32,
+}
+
+impl Drive {
+    fn new(queue: Vec<DriveStep>) -> Self {
+        Drive {
+            grid: tui::TestBackend::new(100, 24),
+            barrier: None,
+            fetch_seen: false,
+            queue: queue.into(),
+            spins: 0,
+        }
+    }
+}
+
+impl tui::Backend for Drive {
+    fn size(&self) -> tui::Rect {
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 24,
+        }
+    }
+
+    fn draw(&mut self, buffer: &tui::Buffer) {
+        self.grid.draw(buffer);
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Option<tui::Event> {
+        let _ = timeout;
+        let text = drive_text(&self.grid);
+        if let Some(barrier) = &self.barrier {
+            if !self.fetch_seen && text.contains("Fetching from Bitbucket...") {
+                self.fetch_seen = true;
+                barrier.wait();
+            }
+        }
+        loop {
+            match self.queue.front() {
+                Some(DriveStep::Until(needle)) if text.contains(needle) => {
+                    self.queue.pop_front();
+                }
+                Some(DriveStep::Until(_)) => {
+                    self.spins += 1;
+                    assert!(self.spins < 10_000, "stalled\n{text}");
+                    std::thread::yield_now();
+                    return None;
+                }
+                Some(DriveStep::Run(_)) => {
+                    if let Some(DriveStep::Run(mut run)) = self.queue.pop_front() {
+                        run();
+                    }
+                }
+                Some(DriveStep::Event(_)) => {
+                    if let Some(DriveStep::Event(event)) = self.queue.pop_front() {
+                        return Some(event);
+                    }
+                }
+                None => {
+                    self.spins += 1;
+                    assert!(self.spins < 10_000, "stalled\n{text}");
+                    std::thread::yield_now();
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+fn drive_text(grid: &tui::TestBackend) -> String {
+    let mut out = String::new();
+    for y in 0..24 {
+        for x in 0..100 {
+            if let Some(cell) = grid.cell(x, y) {
+                out.push(glyph_char(&cell.glyph));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn step_key(ch: char) -> DriveStep {
+    DriveStep::Event(tui::Event::Key(tui::KeyCode::Char(ch)))
+}
+
+#[test]
+fn tui_holder_opens_refreshes_and_releases_the_lock() {
+    let cwd = watch_dir("tui-holder");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        DriveStep::Event(tui::Event::Resize {
+            width: 100,
+            height: 24,
+        }),
+        DriveStep::Event(tui::Event::Key(tui::KeyCode::Enter)),
+        DriveStep::Event(tui::Event::Key(tui::KeyCode::Enter)),
+        step_key('r'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let mut opened = Vec::new();
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |url| {
+        opened.push(url.to_owned());
+        if opened.len() == 1 {
+            Ok(())
+        } else {
+            Err(host::Error::Missing {
+                program: "xdg-open".to_owned(),
+            })
+        }
+    });
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert_eq!(
+        opened,
+        vec![
+            "https://git.example.invalid/pull/12".to_owned(),
+            "https://git.example.invalid/pull/12".to_owned(),
+        ]
+    );
+    assert!(exit.stderr.contains("xdg-open must be on PATH."));
+    assert!(!exit.stderr.contains("secret-token"));
+    assert!(cwd.join("refresh").is_file());
+    assert!(!cwd.join("poll.lock").exists());
+    assert!(drive_text(&backend.grid).contains("Fix the pipe"));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn tui_shows_token_rejected_and_a_failed_poll() {
+    let cwd = watch_dir("tui-auth");
+    let log = cwd.join("bistill.log");
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!(
+            "state_dir = {}\npoll_seconds = 15\nlog_file = {}\n",
+            cwd.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    let row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    bistill_lib::write_snapshot(&cwd, &sample_snapshot(vec![row], Vec::new())).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![fault(401, None)]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Token rejected.".to_owned()),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert!(drive_text(&backend.grid).contains("Fix the pipe"));
+    assert!(drive_text(&backend.grid).contains("Token rejected."));
+    assert!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .contains("Token rejected.")
+    );
+    assert!(!cwd.join("poll.lock").exists());
+
+    let cwd = watch_dir("tui-500");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![fault(500, None)]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![DriveStep::Until("HTTP 500".to_owned()), step_key('q')]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert!(drive_text(&backend.grid).contains("HTTP 500"));
+    fs::remove_dir_all(&cwd).unwrap();
+    let _ = fs::remove_dir_all(
+        std::env::temp_dir().join(format!("bistill-bin-tui-auth-{}", std::process::id())),
+    );
+}
+
+#[test]
+fn tui_viewer_rereads_and_leaves_the_holder() {
+    let cwd = watch_dir("tui-viewer");
+    fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
+    let first = cwd.clone();
+    let second = cwd.clone();
+    let garbage = cwd.clone();
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fetching from Bitbucket...".to_owned()),
+        DriveStep::Run(Box::new(move || {
+            let row = sample_row("PRJ", "repo", 12, "First pipe", false, false, false);
+            bistill_lib::write_snapshot(&first, &sample_snapshot(vec![row], Vec::new())).unwrap();
+        })),
+        DriveStep::Until("First pipe".to_owned()),
+        DriveStep::Run(Box::new(move || {
+            let row = sample_row("PRJ", "repo", 13, "Second pipe", false, false, false);
+            bistill_lib::write_snapshot(&second, &sample_snapshot(vec![row], Vec::new())).unwrap();
+        })),
+        DriveStep::Until("Second pipe".to_owned()),
+        DriveStep::Run(Box::new(move || {
+            fs::write(garbage.join("snapshot.json"), b"{").unwrap();
+        })),
+        step_key('r'),
+        step_key('q'),
+    ]);
+    let mut session = feed(Vec::new());
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    let text = drive_text(&backend.grid);
+    assert!(text.contains("Second pipe"));
+    assert!(text.contains(&format!("Holder {}.", std::process::id())));
+    assert!(cwd.join("refresh").is_file());
+    assert_eq!(
+        fs::read_to_string(cwd.join("poll.lock")).unwrap().trim(),
+        std::process::id().to_string()
+    );
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
+    let cwd = watch_dir("tui-quit");
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.forever = true;
+    session.jump = 0;
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('q'),
+    ]);
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert!(!cwd.join("poll.lock").exists());
+
+    let cwd = watch_dir("tui-missing");
+    let mut session = feed(vec![Err(bistill_lib::InboxFault {
+        error: Error::Curl(CurlFault::Missing {
+            program: "curl".to_owned(),
+        }),
+        retry_after_ms: None,
+    })]);
+    let mut backend = Drive::new(Vec::new());
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 2, "{}", exit.stderr);
+    assert!(exit.stderr.contains("curl must be on PATH."));
+    assert!(!cwd.join("poll.lock").exists());
+
+    let cwd = watch_dir("tui-log-dir");
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!(
+            "state_dir = {}\npoll_seconds = 15\nlog_file = {}\n",
+            cwd.display(),
+            cwd.display()
+        ),
+    )
+    .unwrap();
+    fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
+    let mut backend = Drive::new(vec![step_key('q')]);
+    let mut session = feed(Vec::new());
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
+    let _ = fs::remove_dir_all(
+        std::env::temp_dir().join(format!("bistill-bin-tui-quit-{}", std::process::id())),
+    );
+    let _ = fs::remove_dir_all(
+        std::env::temp_dir().join(format!("bistill-bin-tui-missing-{}", std::process::id())),
+    );
+}
+
+#[test]
+fn tui_prepare_and_phases() {
+    let cwd = watch_dir("tui-config");
+    let err = match prepare(&cwd, &Env::new()) {
+        Err(err) => err,
+        Ok(_) => panic!("config"),
+    };
+    assert_eq!(err.code, 1);
+    assert!(!err.stderr.is_empty());
+
+    fs::write(cwd.join("snapshot.json"), b"{").unwrap();
+    let err = match prepare(&cwd, &env_token()) {
+        Err(err) => err,
+        Ok(_) => panic!("json"),
+    };
+    assert_eq!(err.code, 5);
+
+    fs::remove_file(cwd.join("snapshot.json")).unwrap();
+    fs::create_dir(cwd.join("poll.lock")).unwrap();
+    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let mut backend = tui::TestBackend::new(40, 8);
+    let mut session = feed(Vec::new());
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
+
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Fetching, 0, "", 0),
+        screen::Phase::Fetching
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Ok, 0, "", 15_000),
+        screen::Phase::Ready
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Auth, 0, "", 0),
+        screen::Phase::Auth
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Tls, 0, "", 0),
+        screen::Phase::Tls
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Unreachable, 5, "", 0),
+        screen::Phase::Unreachable { since_ms: 5 }
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::RateLimited, 0, "", 0),
+        screen::Phase::RateLimited
+    ));
+    assert!(matches!(
+        super::app::screen_phase(bistill_lib::SnapshotStatus::Error, 0, "HTTP 500", 0),
+        screen::Phase::Failed { message } if message == "HTTP 500"
+    ));
+    let mut screen = screen::Screen::new();
+    let drawn = draw_screen(
+        &mut screen,
+        80,
+        8,
+        None,
+        &screen::Role::Holder(screen::Phase::Failed {
+            message: "HTTP 500".to_owned(),
+        }),
+        0,
+    );
+    assert!(table_has(&drawn, "HTTP 500"));
+
+    match browser("https://git.example.invalid/pull/12") {
+        host::Open::XdgOpen {
+            program,
+            url,
+            timeout,
+        } => {
+            assert_eq!(program, "xdg-open");
+            assert_eq!(url, "https://git.example.invalid/pull/12");
+            assert_eq!(timeout, Duration::from_secs(15));
+        }
+        host::Open::WindowsStart { .. } => panic!("xdg-open"),
+    }
+    let offset = super::zone_os::local_offset_secs();
+    assert!(offset.unsigned_abs() <= 24 * 60 * 60);
+}

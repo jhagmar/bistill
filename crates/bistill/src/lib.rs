@@ -1,17 +1,32 @@
-//! `bistill ping`, `bistill ls`, and `bistill watch`.
+//! `bistill ping`, `bistill ls`, `bistill watch`, and the inbox screen.
 //!
 //! `ping` lists the curl version, TLS, the Bitbucket version, the user, and
 //! the inbox count. `ls` prints the two inbox sections and notifies when the
 //! snapshot changes. `watch` holds `poll.lock` and polls on this thread.
-//! `--json` prints the raw bodies for `ping` and the snapshot for `ls`. The
-//! screen draws that snapshot on a `tui` buffer.
+//! With no subcommand, a terminal on stdout runs that poller on a thread and
+//! draws the screen. `--json` prints the raw bodies for `ping` and the
+//! snapshot for `ls`.
 
 #![deny(unsafe_code)]
 
+mod app;
 mod args;
 mod lock;
 mod screen;
 mod watch;
+
+#[cfg(unix)]
+#[path = "open_unix.rs"]
+mod open_os;
+#[cfg(windows)]
+#[path = "open_windows.rs"]
+mod open_os;
+#[cfg(unix)]
+#[path = "zone_unix.rs"]
+mod zone_os;
+#[cfg(windows)]
+#[path = "zone_windows.rs"]
+mod zone_os;
 
 #[cfg(unix)]
 #[path = "pid_unix.rs"]
@@ -32,6 +47,9 @@ mod notify_bin;
 #[cfg(windows)]
 #[path = "notify_windows.rs"]
 mod notify_bin;
+
+pub use app::{Exit, Prepared, drive, prepare};
+pub use open_os::browser;
 
 use args::{Command, Ls, Ping, Watch};
 use bistill_lib::{

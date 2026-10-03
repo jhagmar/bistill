@@ -6,6 +6,8 @@
 //! at least 15), doubles, and stops at 10 minutes. HTTP 429 uses `Retry-After`
 //! when that delay is present. A `refresh` file is deleted within about a
 //! second and the next poll is not sooner than `poll_seconds` after the last one.
+//!
+//! [`Board`] is the value the screen draws while this loop runs.
 
 use crate::lock::{self, Acquire};
 use crate::{Session, explain, send_notices};
@@ -14,6 +16,7 @@ use bistill_lib::{
     write_snapshot,
 };
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const CAP_MS: u64 = 10 * 60 * 1000;
@@ -32,6 +35,50 @@ enum Wait {
 pub(crate) struct Outcome {
     pub stderr: String,
     pub code: i32,
+}
+
+/// Rows applied so far, and the phase the screen draws.
+pub(crate) struct Board {
+    /// The last applied snapshot. Absent until the first successful poll.
+    pub snapshot: Option<Snapshot>,
+    /// `Fetching`, `Ready`, or a backoff after a failed poll.
+    pub phase: PollPhase,
+    /// The screen sets this when the user quits. The loop returns.
+    pub stop: bool,
+    /// Exit code once the loop has returned. `0` while it is still running.
+    pub code: i32,
+    /// Poll and open errors. The screen writes this after it restores the terminal.
+    pub log: String,
+    /// Display line for [`SnapshotStatus::Error`].
+    pub note: String,
+}
+
+/// Phase stored on [`Board`].
+pub(crate) enum PollPhase {
+    /// A fetch is in flight. Known rows stay in `snapshot`.
+    Fetching,
+    /// The latest poll was applied.
+    Ready,
+    /// The next poll waits until `next_attempt_ms`.
+    Backoff {
+        /// Snapshot status written for this failure.
+        status: SnapshotStatus,
+        /// Earliest epoch milliseconds for the next poll.
+        next_attempt_ms: u64,
+    },
+}
+
+impl Board {
+    pub(crate) fn new(snapshot: Option<Snapshot>) -> Self {
+        Board {
+            snapshot,
+            phase: PollPhase::Ready,
+            stop: false,
+            code: 0,
+            log: String::new(),
+            note: String::new(),
+        }
+    }
 }
 
 pub(crate) fn run(session: &mut dyn Session, config: &Config, verbose: bool) -> Outcome {
@@ -59,16 +106,17 @@ pub(crate) fn run(session: &mut dyn Session, config: &Config, verbose: bool) -> 
             };
         }
     };
-    let outcome = poll(session, config, verbose, previous);
+    let board = Mutex::new(Board::new(previous));
+    let outcome = poll(session, config, verbose, &board);
     drop(held);
     outcome
 }
 
-fn poll(
+pub(crate) fn poll(
     session: &mut dyn Session,
     config: &Config,
     verbose: bool,
-    mut previous: Option<Snapshot>,
+    board: &Mutex<Board>,
 ) -> Outcome {
     let mut stderr = String::new();
     let mut gap = Gap::First;
@@ -79,12 +127,13 @@ fn poll(
     loop {
         let now = session.now_ms();
         if now < next_ms {
-            match wait(session, &config.state_dir, next_ms, last_ms, floor) {
+            match wait(session, board, &config.state_dir, next_ms, last_ms, floor) {
                 Wait::Ready(next) => next_ms = next,
                 Wait::Stop => break,
             }
             continue;
         }
+        set_phase(board, PollPhase::Fetching);
         match session.poll(&client, now) {
             Ok(listed) => {
                 if verbose {
@@ -93,15 +142,21 @@ fn poll(
                         stderr.push('\n');
                     }
                 }
-                let changes = diff(previous.as_ref(), &listed.snapshot);
-                if let Err(err) = write_snapshot(&config.state_dir, &listed.snapshot) {
-                    return Outcome {
-                        stderr: explain(&err),
-                        code: bistill_lib::exit_code(&err),
-                    };
-                }
+                let changes = {
+                    let mut guard = board.lock().unwrap();
+                    let changes = diff(guard.snapshot.as_ref(), &listed.snapshot);
+                    if let Err(err) = write_snapshot(&config.state_dir, &listed.snapshot) {
+                        return Outcome {
+                            stderr: explain(&err),
+                            code: bistill_lib::exit_code(&err),
+                        };
+                    }
+                    guard.note.clear();
+                    guard.snapshot = Some(listed.snapshot);
+                    guard.phase = PollPhase::Ready;
+                    changes
+                };
                 stderr.push_str(&send_notices(session, &changes));
-                previous = Some(listed.snapshot);
                 last_ms = now;
                 gap = Gap::Steady;
                 next_ms = now.saturating_add(floor);
@@ -111,26 +166,44 @@ fn poll(
                     stderr.push_str(&explain(&fault.error));
                     return Outcome { stderr, code: 2 };
                 }
-                if let Some(snapshot) = previous.as_mut() {
-                    apply_status(snapshot, poll_status(&fault.error), now);
-                    if let Err(err) = write_snapshot(&config.state_dir, snapshot) {
-                        return Outcome {
-                            stderr: explain(&err),
-                            code: bistill_lib::exit_code(&err),
-                        };
-                    }
-                }
-                stderr.push_str(&explain(&fault.error));
+                let status = poll_status(&fault.error);
                 let delay = backoff(&mut gap, floor, retry_delay(&fault));
+                let note = explain(&fault.error);
+                {
+                    let mut guard = board.lock().unwrap();
+                    if let Some(snapshot) = guard.snapshot.as_mut() {
+                        apply_status(snapshot, status, now);
+                        if let Err(err) = write_snapshot(&config.state_dir, snapshot) {
+                            return Outcome {
+                                stderr: explain(&err),
+                                code: bistill_lib::exit_code(&err),
+                            };
+                        }
+                    }
+                    guard.note = note.trim_end().to_owned();
+                    guard.phase = PollPhase::Backoff {
+                        status,
+                        next_attempt_ms: now.saturating_add(delay),
+                    };
+                }
+                stderr.push_str(&note);
                 last_ms = now;
                 next_ms = now.saturating_add(delay);
             }
         }
-        if !session.again() {
+        if stopped(board) || !session.again() {
             break;
         }
     }
     Outcome { stderr, code: 0 }
+}
+
+fn set_phase(board: &Mutex<Board>, phase: PollPhase) {
+    board.lock().unwrap().phase = phase;
+}
+
+fn stopped(board: &Mutex<Board>) -> bool {
+    board.lock().unwrap().stop
 }
 
 fn missing_curl(fault: &InboxFault) -> bool {
@@ -179,12 +252,16 @@ fn backoff(gap: &mut Gap, floor: u64, retry_after_ms: Option<u64>) -> u64 {
 
 fn wait(
     session: &mut dyn Session,
+    board: &Mutex<Board>,
     state_dir: &Path,
     mut target: u64,
     last_ms: u64,
     floor: u64,
 ) -> Wait {
     loop {
+        if stopped(board) || !session.again() {
+            return Wait::Stop;
+        }
         let now = session.now_ms();
         if now >= target {
             return Wait::Ready(target);
@@ -196,9 +273,6 @@ fn wait(
             if earliest < target {
                 target = earliest;
             }
-        }
-        if !session.again() {
-            return Wait::Stop;
         }
     }
 }

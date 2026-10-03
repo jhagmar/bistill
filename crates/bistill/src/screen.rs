@@ -52,6 +52,11 @@ pub(crate) enum Phase {
     },
     /// HTTP 429.
     RateLimited,
+    /// Another poll failure. `message` is that error's display line.
+    Failed {
+        /// The line shown in the footer.
+        message: String,
+    },
 }
 
 /// Who is drawing.
@@ -758,6 +763,7 @@ fn footer(role: &Role, loaded: bool, offset_secs: i32) -> String {
             )
         }
         Role::Holder(Phase::RateLimited) => "Rate limited.".to_owned(),
+        Role::Holder(Phase::Failed { message }) => message.clone(),
     }
 }
 

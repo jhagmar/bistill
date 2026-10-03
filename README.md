@@ -38,6 +38,14 @@ https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/12"
 
 On Windows, `ls` shows a PowerShell toast. A click opens the pull request.
 
+## Inbox
+
+With no subcommand, a terminal on stdout opens the inbox. The process that
+takes `poll.lock` polls on a thread and sends the same notifications as
+`watch`. A second `bistill` in a terminal reads `snapshot.json` and leaves
+polling to that process. `q` restores the terminal. Any other stdout prints
+usage and exits 1.
+
 ## watch
 
 `bistill watch` polls on this process and sends a notification when the inbox
