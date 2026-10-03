@@ -1,4 +1,4 @@
-//! Hand-rolled argv for `bistill ping` and `bistill ls`.
+//! Hand-rolled argv for `bistill ping`, `bistill ls`, and `bistill watch`.
 
 use bistill_lib::Flags;
 use std::ffi::OsString;
@@ -7,6 +7,7 @@ use std::path::PathBuf;
 const USAGE: &str = "\
 Usage: bistill ping [--json] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
        bistill ls [--json] [--count] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
+       bistill watch [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
 ";
 
 /// What to run.
@@ -17,6 +18,8 @@ pub(crate) enum Command {
     Ping(Ping),
     /// `ls`.
     Ls(Ls),
+    /// `watch`.
+    Watch(Watch),
 }
 
 /// Flags for `ping`.
@@ -43,9 +46,19 @@ pub(crate) struct Ls {
     pub flags: Flags,
 }
 
+/// Flags for `watch`.
+#[derive(Default)]
+pub(crate) struct Watch {
+    /// `--verbose`.
+    pub verbose: bool,
+    /// Config overrides.
+    pub flags: Flags,
+}
+
 enum Kind {
     Ping,
     Ls,
+    Watch,
 }
 
 /// Why argv was rejected.
@@ -72,6 +85,8 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
         Kind::Ping
     } else if first == "ls" {
         Kind::Ls
+    } else if first == "watch" {
+        Kind::Watch
     } else {
         return Err(Usage::Unknown);
     };
@@ -85,7 +100,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
         }
         let name = arg.to_str().ok_or(Usage::NotUtf8)?;
         match name {
-            "--json" => json = true,
+            "--json" if !matches!(kind, Kind::Watch) => json = true,
             "--count" if matches!(kind, Kind::Ls) => count = true,
             "--verbose" => verbose = true,
             "--url" => flags.base_url = Some(value(&mut iter, "--url")?),
@@ -109,6 +124,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
             verbose,
             flags,
         })),
+        Kind::Watch => Ok(Command::Watch(Watch { verbose, flags })),
     }
 }
 
@@ -144,7 +160,7 @@ pub(crate) fn help_text() -> String {
 
 pub(crate) fn usage_text(usage: &Usage) -> String {
     let reason = match usage {
-        Usage::Bare => "Run ping or ls.".to_owned(),
+        Usage::Bare => "Run ping, ls, or watch.".to_owned(),
         Usage::Unknown => "Unknown argument.".to_owned(),
         Usage::NeedsValue(flag) => format!("{flag} needs a value."),
         Usage::NotUtf8 => "The argument must be UTF-8.".to_owned(),

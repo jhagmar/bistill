@@ -1,14 +1,24 @@
-//! `bistill ping` and `bistill ls`.
+//! `bistill ping`, `bistill ls`, and `bistill watch`.
 //!
 //! `ping` lists the curl version, TLS, the Bitbucket version, the user, and
 //! the inbox count. `ls` prints the two inbox sections and notifies when the
-//! snapshot changes. `--json` prints the raw bodies for `ping` and the
-//! snapshot for `ls`. The screen draws that snapshot on a `tui` buffer.
+//! snapshot changes. `watch` holds `poll.lock` and polls on this thread.
+//! `--json` prints the raw bodies for `ping` and the snapshot for `ls`. The
+//! screen draws that snapshot on a `tui` buffer.
 
 #![deny(unsafe_code)]
 
 mod args;
+mod lock;
 mod screen;
+mod watch;
+
+#[cfg(unix)]
+#[path = "pid_unix.rs"]
+mod pid_os;
+#[cfg(windows)]
+#[path = "pid_windows.rs"]
+mod pid_os;
 
 #[cfg(unix)]
 #[path = "curl_unix.rs"]
@@ -23,10 +33,10 @@ mod notify_bin;
 #[path = "notify_windows.rs"]
 mod notify_bin;
 
-use args::{Command, Ls, Ping};
+use args::{Command, Ls, Ping, Watch};
 use bistill_lib::{
-    Client, CurlFault, Env, Error, Listed, Report, Row, Snapshot, attention_count, exit_code,
-    redact_argv, to_json,
+    Client, CurlFault, Env, Error, InboxFault, Listed, Report, Row, Snapshot, attention_count,
+    exit_code, redact_argv, to_json,
 };
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -43,6 +53,20 @@ pub trait Session {
     fn list(&mut self, client: &Client, now_ms: u64) -> Result<Listed, Error>;
     /// Show one OS notification.
     fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error>;
+    /// One poll. `Retry-After` is kept on HTTP 429.
+    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, InboxFault>;
+    /// Epoch milliseconds for the poll schedule.
+    fn now_ms(&mut self) -> u64 {
+        unix_ms(SystemTime::now())
+    }
+    /// Wait before the next poll. `watch` calls this in slices of about a second.
+    fn pause(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+    /// `false` ends `watch`. The live session keeps polling.
+    fn again(&mut self) -> bool {
+        true
+    }
 }
 
 /// [`Session`] that runs `curl` on this machine.
@@ -63,6 +87,10 @@ impl Session for Live {
 
     fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
         host::toast(toast)
+    }
+
+    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, InboxFault> {
+        bistill_lib::poll_list(client, &mut bistill_lib::CurlFetch, now_ms)
     }
 }
 
@@ -106,6 +134,21 @@ fn render(
         },
         Ok(Command::Ping(ping)) => render_ping(cwd, env, session, &ping),
         Ok(Command::Ls(ls)) => render_ls(cwd, env, session, &ls),
+        Ok(Command::Watch(watch)) => render_watch(cwd, env, session, &watch),
+    }
+}
+
+fn render_watch(cwd: &Path, env: &Env, session: &mut dyn Session, watch: &Watch) -> Rendered {
+    let config = match bistill_lib::load(cwd, &watch.flags, env) {
+        Ok(config) => config,
+        Err(err) => return fail(&err, None),
+    };
+    let outcome = watch::run(session, &config, watch.verbose);
+    Rendered {
+        stdout: String::new(),
+        stderr: outcome.stderr,
+        log: config.log_file,
+        code: outcome.code,
     }
 }
 

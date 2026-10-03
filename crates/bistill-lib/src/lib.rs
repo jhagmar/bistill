@@ -24,7 +24,8 @@ pub use inbox::{
 };
 pub use json::Error as JsonError;
 pub use list::{
-    ENRICH_CAP, Listed, Snapshot, SnapshotStatus, attention_count, list_inbox, to_json,
+    ENRICH_CAP, InboxFault, Listed, Snapshot, SnapshotStatus, attention_count, list_inbox,
+    poll_list, to_json,
 };
 pub use notify::{TITLE, toast_body};
 pub use ping::{

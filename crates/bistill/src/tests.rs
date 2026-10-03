@@ -94,6 +94,14 @@ impl Session for Script {
             Ok(())
         }
     }
+
+    fn poll(&mut self, client: &Client, now_ms: u64) -> Result<Listed, bistill_lib::InboxFault> {
+        self.list(client, now_ms)
+            .map_err(|error| bistill_lib::InboxFault {
+                error,
+                retry_after_ms: None,
+            })
+    }
 }
 
 fn run(words: &[&str], cwd: &Path, env: &Env, script: Script) -> (i32, String, String, String) {
@@ -137,7 +145,7 @@ fn help_lists_ping_options() {
     assert!(stdout.contains("--json"));
     assert!(stdout.contains("--count"));
     assert!(stdout.contains("--verbose"));
-    assert!(!stdout.contains("watch"));
+    assert!(stdout.contains("bistill watch"));
     assert!(!stdout.contains("The Bitbucket list you were missing."));
     assert!(stderr.is_empty());
     let (again, text, _, _) = run(&["-h"], &cwd, &env_token(), ready(Ok(report())));
@@ -161,9 +169,9 @@ fn usage_names_the_next_step() {
     let (code, stdout, stderr, _) = run(&[], &cwd, &env, ready(Ok(report())));
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("Run ping or ls."));
+    assert!(stderr.contains("Run ping, ls, or watch."));
     assert!(stderr.contains("Usage: bistill ping"));
-    let (_, _, unknown, _) = run(&["watch"], &cwd, &env, ready(Ok(report())));
+    let (_, _, unknown, _) = run(&["serve"], &cwd, &env, ready(Ok(report())));
     assert!(unknown.contains("Unknown argument."));
     let (_, _, counted, _) = run(&["ping", "--count"], &cwd, &env, ready(Ok(report())));
     assert!(counted.contains("Unknown argument."));
@@ -178,6 +186,8 @@ fn usage_names_the_next_step() {
     assert!(dashed.contains("--url needs a value."));
     let (_, _, flag, _) = run(&["ping", "--color"], &cwd, &env, ready(Ok(report())));
     assert!(flag.contains("Unknown argument."));
+    let (_, _, watch_json, _) = run(&["watch", "--json"], &cwd, &env, ready(Ok(report())));
+    assert!(watch_json.contains("Unknown argument."));
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -2001,4 +2011,467 @@ fn screen_formats_clock_text() {
     assert_eq!(screen::absolute(0, -60), "1970-01-01 00:00");
     assert_eq!(screen::absolute(0, 3_600), "1970-01-01 01:00");
     assert_eq!(screen::absolute(1_000_000_000_000, 0), "2001-09-09 01:46");
+}
+
+fn watch_dir(name: &str) -> PathBuf {
+    let cwd = temp(name);
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!("state_dir = {}\npoll_seconds = 15\n", cwd.display()),
+    )
+    .unwrap();
+    cwd
+}
+
+struct Poller {
+    steps: Vec<Result<Listed, bistill_lib::InboxFault>>,
+    now: u64,
+    jump: u64,
+    pauses: Vec<u64>,
+    stop_after_polls: u32,
+    polls: u32,
+    stop_after_pauses: Option<u32>,
+    refresh: bool,
+    readonly_on: Option<u32>,
+    state: PathBuf,
+    toasts: Vec<host::Toast>,
+    fail_notify: bool,
+}
+
+impl Session for Poller {
+    fn version(&mut self, _: &str) -> Result<String, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn ping(&mut self, _: &Client) -> Result<Report, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn list(&mut self, _: &Client, _: u64) -> Result<Listed, Error> {
+        Err(Error::Auth("unused".to_owned()))
+    }
+
+    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
+        self.toasts.push(toast.clone());
+        if self.fail_notify {
+            Err(host::Error::Missing {
+                program: notify_bin::PROGRAM.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn poll(&mut self, _: &Client, _: u64) -> Result<Listed, bistill_lib::InboxFault> {
+        self.polls += 1;
+        if self.readonly_on == Some(self.polls) {
+            self.readonly_on = None;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let (path, mode) = if self.polls == 1 {
+                    (self.state.clone(), 0o555)
+                } else {
+                    (self.state.join("snapshot.json"), 0o444)
+                };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        self.steps.remove(0)
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.now
+    }
+
+    fn pause(&mut self, duration: Duration) {
+        self.pauses.push(duration.as_millis() as u64);
+        if self.refresh {
+            fs::write(self.state.join("refresh"), b"").unwrap();
+            self.refresh = false;
+        }
+        self.now += self.jump;
+    }
+
+    fn again(&mut self) -> bool {
+        if self
+            .stop_after_pauses
+            .is_some_and(|count| self.pauses.len() as u32 >= count)
+        {
+            return false;
+        }
+        self.polls < self.stop_after_polls
+    }
+}
+
+fn poller(cwd: &Path, steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Poller {
+    Poller {
+        steps,
+        now: 1_000_000,
+        jump: 20_000,
+        pauses: Vec::new(),
+        stop_after_polls: 1,
+        polls: 0,
+        stop_after_pauses: None,
+        refresh: false,
+        readonly_on: None,
+        state: cwd.to_owned(),
+        toasts: Vec::new(),
+        fail_notify: false,
+    }
+}
+
+fn listed_ok(rows: Vec<Row>) -> Result<Listed, bistill_lib::InboxFault> {
+    Ok(Listed {
+        snapshot: sample_snapshot(rows, Vec::new()),
+        requests: vec![host::Request {
+            program: "curl".to_owned(),
+            url: "https://git.example.invalid/rest".to_owned(),
+            headers: vec!["Authorization: Bearer secret-token".to_owned()],
+            user_agent: "bistill/0.1.0 (internal)".to_owned(),
+            timeout: Duration::from_secs(15),
+            ca_file: None,
+            fail_with_body: true,
+        }],
+    })
+}
+
+fn fault(status: u16, retry_after_ms: Option<u64>) -> Result<Listed, bistill_lib::InboxFault> {
+    Err(bistill_lib::InboxFault {
+        error: Error::Http(status),
+        retry_after_ms,
+    })
+}
+
+fn run_watch(cwd: &Path, poller: &mut Poller) -> (i32, String) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["watch", "--verbose"]),
+        cwd,
+        &env_token(),
+        &mut stdout,
+        &mut stderr,
+        poller,
+    );
+    (code, String::from_utf8(stderr).unwrap())
+}
+
+#[test]
+fn watch_polls_backs_off_and_releases_the_lock() {
+    let cwd = watch_dir("watch-poll");
+    let again = || sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    let mut session = poller(
+        &cwd,
+        vec![listed_ok(vec![again()]), listed_ok(vec![again()])],
+    );
+    session.fail_notify = true;
+    session.stop_after_polls = 2;
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("Bearer ***"));
+    assert!(!stderr.contains("secret-token"));
+    assert_eq!(session.toasts.len(), 1);
+    assert!(stderr.contains("must be on PATH."));
+    assert_eq!(session.pauses, vec![1_000]);
+    assert!(!cwd.join("poll.lock").exists());
+    let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
+    assert_eq!(snapshot.needs_review.len(), 1);
+
+    let cwd = watch_dir("watch-auth");
+    let row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    let mut session = poller(
+        &cwd,
+        vec![listed_ok(vec![row]), fault(401, None), fault(401, None)],
+    );
+    session.stop_after_polls = 3;
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.contains("Token rejected."));
+    let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
+    assert_eq!(snapshot.needs_review.len(), 1);
+    assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Auth);
+    assert_eq!(snapshot.status_since_ms, 1_020_000);
+
+    let cwd = watch_dir("watch-double");
+    let mut session = poller(
+        &cwd,
+        vec![fault(500, None), fault(500, None), fault(500, None)],
+    );
+    session.stop_after_polls = 3;
+    let (code, _) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0);
+    assert_eq!(session.pauses, vec![1_000, 1_000, 1_000]);
+    assert!(!cwd.join("snapshot.json").exists());
+
+    let cwd = watch_dir("watch-refresh");
+    let mut session = poller(&cwd, vec![fault(429, Some(120_000)), listed_ok(Vec::new())]);
+    session.stop_after_polls = 2;
+    session.jump = 200_000;
+    session.refresh = true;
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(session.pauses, vec![1_000]);
+    assert!(!cwd.join("refresh").exists());
+    let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
+    assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Ok);
+
+    let cwd = watch_dir("watch-floor");
+    let mut session = poller(&cwd, vec![fault(429, Some(15_000))]);
+    session.stop_after_polls = 2;
+    session.stop_after_pauses = Some(1);
+    session.refresh = true;
+    let (code, _) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0);
+    assert!(session.polls == 1);
+
+    let cwd = watch_dir("watch-cap");
+    let mut session = poller(
+        &cwd,
+        vec![
+            fault(429, Some(700_000)),
+            fault(401, None),
+            listed_ok(Vec::new()),
+        ],
+    );
+    session.stop_after_polls = 3;
+    session.jump = 650_000;
+    let (code, _) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0);
+    assert_eq!(session.pauses.len(), 2);
+
+    let cwd = watch_dir("watch-missing");
+    let mut session = poller(
+        &cwd,
+        vec![Err(bistill_lib::InboxFault {
+            error: Error::Curl(CurlFault::Missing {
+                program: "curl".to_owned(),
+            }),
+            retry_after_ms: None,
+        })],
+    );
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("curl must be on PATH."));
+    assert!(!cwd.join("poll.lock").exists());
+
+    for cwd in [
+        "watch-poll",
+        "watch-auth",
+        "watch-double",
+        "watch-refresh",
+        "watch-floor",
+        "watch-cap",
+        "watch-missing",
+    ] {
+        let _ = fs::remove_dir_all(
+            std::env::temp_dir().join(format!("bistill-bin-{cwd}-{}", std::process::id())),
+        );
+    }
+}
+
+#[test]
+fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
+    let cwd = watch_dir("watch-busy");
+    fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(stderr.contains(&format!("pid {}).", std::process::id())));
+    assert!(cwd.join("poll.lock").exists());
+
+    let cwd = watch_dir("watch-dead");
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    assert!(!super::pid_os::pid_alive(pid));
+    assert!(super::pid_os::pid_alive(std::process::id()));
+    assert!(!super::pid_os::pid_alive(0));
+    fs::write(cwd.join("poll.lock"), format!("{pid}\n")).unwrap();
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!cwd.join("poll.lock").exists());
+
+    let cwd = watch_dir("watch-garbage");
+    fs::write(cwd.join("poll.lock"), "nope\n").unwrap();
+    let held = match super::lock::acquire(&cwd).unwrap() {
+        super::lock::Acquire::Holder(held) => held,
+        super::lock::Acquire::Busy { pid } => panic!("busy {pid}"),
+    };
+    let text = fs::read_to_string(cwd.join("poll.lock")).unwrap();
+    assert_eq!(text.trim(), std::process::id().to_string());
+    drop(held);
+    assert!(!cwd.join("poll.lock").exists());
+
+    let missing = match super::lock::acquire(Path::new("/no/such/bistill-state")) {
+        Err(err) => err,
+        Ok(_) => panic!("missing dir"),
+    };
+    assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+    let cwd = watch_dir("watch-dir-lock");
+    fs::create_dir(cwd.join("poll.lock")).unwrap();
+    assert!(super::lock::acquire(&cwd).is_err());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let cwd = watch_dir("watch-unreadable");
+        fs::write(cwd.join("poll.lock"), "1\n").unwrap();
+        fs::set_permissions(cwd.join("poll.lock"), fs::Permissions::from_mode(0o000)).unwrap();
+        let held = match super::lock::acquire(&cwd).unwrap() {
+            super::lock::Acquire::Holder(held) => held,
+            super::lock::Acquire::Busy { .. } => panic!("busy"),
+        };
+        drop(held);
+    }
+
+    let cwd = watch_dir("watch-corrupt");
+    fs::write(cwd.join("snapshot.json"), "{").unwrap();
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 5, "{stderr}");
+    assert!(!cwd.join("poll.lock").exists());
+
+    let _ = fs::remove_dir_all(&cwd);
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_returns_when_the_snapshot_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = watch_dir("watch-write-ok");
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    session.readonly_on = Some(1);
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 1, "{stderr}");
+
+    let cwd = watch_dir("watch-write-err");
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new()), fault(401, None)]);
+    session.stop_after_polls = 2;
+    session.readonly_on = Some(2);
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 1, "{stderr}");
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn watch_status_follows_the_failure() {
+    assert_eq!(
+        watch::poll_status(&Error::Http(401)),
+        bistill_lib::SnapshotStatus::Auth
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Http(429)),
+        bistill_lib::SnapshotStatus::RateLimited
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Http(500)),
+        bistill_lib::SnapshotStatus::Error
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Tls("verify".to_owned())),
+        bistill_lib::SnapshotStatus::Tls
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Curl(CurlFault::Timeout {
+            program: "curl".to_owned(),
+        })),
+        bistill_lib::SnapshotStatus::Unreachable
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Curl(CurlFault::Failed {
+            program: "curl".to_owned(),
+            message: "reset".to_owned(),
+        })),
+        bistill_lib::SnapshotStatus::Unreachable
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Io(std::io::Error::other("down"))),
+        bistill_lib::SnapshotStatus::Unreachable
+    );
+    assert_eq!(
+        watch::poll_status(&Error::Auth("no".to_owned())),
+        bistill_lib::SnapshotStatus::Error
+    );
+
+    let cwd = watch_dir("watch-tls");
+    let mut session = poller(
+        &cwd,
+        vec![
+            listed_ok(Vec::new()),
+            Err(bistill_lib::InboxFault {
+                error: Error::Tls("verify".to_owned()),
+                retry_after_ms: Some(1),
+            }),
+        ],
+    );
+    session.stop_after_polls = 2;
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 0, "{stderr}");
+    let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
+    assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Tls);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn live_poll_reports_a_missing_program() {
+    let cwd = watch_dir("live-poll");
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
+    let client = Client::new("bistill-missing-poll", &config);
+    let err = match Live.poll(&client, 1) {
+        Err(err) => err,
+        Ok(_) => panic!("missing"),
+    };
+    assert!(matches!(
+        err.error,
+        Error::Curl(CurlFault::Missing { program }) if program == "bistill-missing-poll"
+    ));
+    assert!(Live.again());
+    assert!(Live.now_ms() > 0);
+    Live.pause(Duration::from_millis(0));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn watch_reports_config_and_lock_errors() {
+    let cwd = watch_dir("watch-config");
+    let mut session = poller(&cwd, Vec::new());
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["watch"]),
+        &cwd,
+        &Env::new(),
+        &mut stdout,
+        &mut stderr,
+        &mut session,
+    );
+    assert_eq!(code, 1);
+    fs::remove_dir_all(&cwd).unwrap();
+
+    let cwd = watch_dir("watch-lock-err");
+    fs::create_dir(cwd.join("poll.lock")).unwrap();
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session);
+    assert_eq!(code, 1, "{stderr}");
+    fs::remove_dir_all(&cwd).unwrap();
+
+    let cwd = watch_dir("watch-quiet");
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = execute(
+        &args(&["watch"]),
+        &cwd,
+        &env_token(),
+        &mut stdout,
+        &mut stderr,
+        &mut session,
+    );
+    assert_eq!(code, 0, "{}", String::from_utf8(stderr).unwrap());
+    fs::remove_dir_all(&cwd).unwrap();
 }
