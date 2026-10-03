@@ -83,6 +83,13 @@ impl Buffer {
         self.index(x, y).map(|index| &self.cells[index])
     }
 
+    /// Replace the style at `x`, `y`. A position outside the grid is left alone.
+    pub fn set_style(&mut self, x: u16, y: u16, style: Style) {
+        if let Some(index) = self.index(x, y) {
+            self.cells[index].style = style;
+        }
+    }
+
     /// Write `span` at `x`, `y`, using at most `columns`.
     ///
     /// Scalars that do not fit are dropped. This does not insert an ellipsis;
