@@ -1,4 +1,4 @@
-//! The 16 ANSI colors and the attributes a cell can carry.
+//! The 16 ANSI colors, and the bold, underline, and reverse attributes a cell can carry.
 
 /// One of the 16 ANSI colors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

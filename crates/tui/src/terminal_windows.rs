@@ -1,7 +1,8 @@
 //! Windows console mode.
 //!
-//! `std` cannot enable virtual-terminal processing. The `unsafe` blocks below
-//! are the wrapper around the console handle calls.
+//! The standard library cannot turn on virtual-terminal processing. The
+//! `unsafe` blocks below are the small wrapper around the console handle
+//! calls.
 
 #![allow(unsafe_code)]
 

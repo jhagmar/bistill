@@ -1,4 +1,4 @@
-//! `key = value` config, then environment, then flags.
+//! Load `key = value` config, then let environment variables and flags override it.
 
 use crate::{ConfigFault, Error};
 use std::collections::BTreeMap;

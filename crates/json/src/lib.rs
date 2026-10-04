@@ -1,11 +1,13 @@
-//! RFC 8259 JSON text.
+//! JSON text, as in RFC 8259.
 //!
-//! [`parse`] reads UTF-8 bytes into a [`Value`]. [`to_vec`] writes that value
-//! as compact UTF-8. This crate does not perform I/O.
+//! [`parse`] turns UTF-8 bytes into a [`Value`]. [`to_vec`] writes that value
+//! back out as compact UTF-8. Reading files and talking to the network happen
+//! in other crates.
 //!
-//! A number keeps the digits from the input. [`Value::as_i64`], [`Value::as_u64`],
-//! and [`Value::as_f64`] read that text. A failed helper leaves the text in place.
-//! Two numbers compare equal when their stored text is equal.
+//! A number is stored as the digits from the input. [`Value::as_i64`],
+//! [`Value::as_u64`], and [`Value::as_f64`] interpret those digits. If a helper
+//! cannot, the digits stay as they were. Two numbers are equal when their
+//! digits are equal.
 
 #![deny(unsafe_code)]
 

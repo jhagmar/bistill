@@ -1,4 +1,4 @@
-//! Windows desktop notification.
+//! A desktop notification on Windows, shown with a PowerShell toast.
 
 use std::time::Duration;
 

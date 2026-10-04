@@ -1,8 +1,9 @@
-//! Inbox list for `ls`.
+//! The inbox list behind `ls` and `watch`.
 //!
 //! [`list_inbox`] reads application-properties, the user, and both inbox roles.
-//! It follows `nextPageStart` and retries a role in lowercase after HTTP 400.
-//! The first 50 OPEN rows are enriched. The rest stay at the list-only defaults.
+//! It follows `nextPageStart`, and if a role comes back HTTP 400 it tries that
+//! role again in lowercase. The 50 oldest open pull requests get the extra
+//! detail. The rest stay in the list with the plain defaults.
 
 use std::collections::HashMap;
 

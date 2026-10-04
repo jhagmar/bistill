@@ -1,4 +1,4 @@
-//! `$XDG_CONFIG_HOME`, `$HOME`, and `$XDG_STATE_HOME`.
+//! Where config and state live on Unix: `$XDG_CONFIG_HOME`, `$HOME`, and `$XDG_STATE_HOME`.
 
 use crate::{ConfigFault, Error};
 use std::path::PathBuf;

@@ -1,7 +1,8 @@
 //! Unix console mode.
 //!
-//! `std` cannot set terminal attributes, wait on a file descriptor with a
-//! timeout, or read the window size. The `unsafe` blocks below are that wrapper.
+//! The standard library cannot set terminal attributes, wait on a file
+//! descriptor with a timeout, or read the window size. The `unsafe` blocks
+//! below are the small wrapper around those calls.
 
 #![allow(unsafe_code)]
 

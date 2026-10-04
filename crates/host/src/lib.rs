@@ -1,9 +1,10 @@
-//! Run a named program on this machine, HTTP GET through `curl`, an OS toast, and open a URL.
+//! Start a program, fetch a URL with `curl`, show a notification, or open a URL.
 //!
-//! The child is the program named by the caller, started from an argument vector.
-//! There is no shell. This crate does not print request headers. The argument
-//! vector passed to `curl` does not include `--insecure`. `curl` still honors
-//! `http_proxy`, `https_proxy`, and `no_proxy`.
+//! The program is the name the caller passed, plus an argument list. Those
+//! arguments go straight to the program, with no shell in between. This crate
+//! does not print request headers. The `curl` arguments leave out `--insecure`,
+//! so TLS verification stays on. `curl` still reads `http_proxy`, `https_proxy`,
+//! and `no_proxy` from the environment.
 
 #![deny(unsafe_code)]
 

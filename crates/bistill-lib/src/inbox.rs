@@ -1,8 +1,8 @@
-//! Inbox pages and the two list sections.
+//! Inbox pages, and how they split into the two sections.
 //!
-//! [`parse_page`] reads one Bitbucket inbox page. [`classify`] keeps OPEN pull
-//! requests, drops merged and declined rows, and splits the rest into Needs
-//! review and Waiting.
+//! [`parse_page`] reads one Bitbucket inbox page. [`classify`] keeps open pull
+//! requests, skips merged and declined ones, and puts the rest into Needs
+//! review or Waiting.
 
 use crate::Error;
 use json::Value;

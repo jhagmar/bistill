@@ -1,9 +1,9 @@
-//! Bitbucket reads for `ping`.
+//! The Bitbucket calls behind `ping`.
 //!
-//! [`ping`] checks TLS against the origin, then GETs application-properties,
-//! `users/{slug}`, and the inbox count. A completed HTTP response on the origin
-//! is a TLS success, including a redirect to a login page. The three REST calls
-//! require status 200 and a JSON object.
+//! [`ping`] checks TLS against the server, then fetches application-properties,
+//! `users/{slug}`, and the inbox count. Any completed HTTP response from the
+//! server counts as TLS working, including a redirect to a login page. The
+//! three REST calls need status 200 and a JSON object.
 
 use crate::{Config, Error};
 use std::path::PathBuf;

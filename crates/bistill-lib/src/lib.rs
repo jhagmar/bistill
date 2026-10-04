@@ -1,9 +1,9 @@
-//! Config, the process error type, ping, inbox classification, enrichment, and `ls`.
+//! Configuration, errors, and the Bitbucket inbox.
 //!
-//! This crate owns `key = value` config, environment and flag overrides,
-//! [`Error`], the ping reads, the split of an inbox page into Needs review
-//! and Waiting, the list snapshot, and notification text. It does not draw a
-//! terminal.
+//! This crate reads `key = value` config, then applies environment variables
+//! and flags. It defines [`Error`], fetches the data for `ping`, splits an
+//! inbox page into Needs review and Waiting, builds the snapshot, and writes
+//! notification text. The terminal screen lives in another crate.
 
 #![deny(unsafe_code)]
 

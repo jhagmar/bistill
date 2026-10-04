@@ -1,4 +1,4 @@
-//! Notification body for one fingerprint change.
+//! The text of a notification when one pull request changes.
 
 use crate::Change;
 

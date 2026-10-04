@@ -1,8 +1,9 @@
-//! Row fingerprints and the on-disk snapshot.
+//! Fingerprints for inbox rows, and `snapshot.json` on disk.
 //!
-//! [`stamp`] writes the lowercase hex record from `idea/spec.md`. [`diff`]
-//! turns two snapshots into reason tokens. [`write_snapshot`] stores the
-//! compact JSON from [`crate::to_json`].
+//! [`stamp`] fills each row with a lowercase hex record of the fields a
+//! notification cares about. [`diff`] compares two snapshots and returns a
+//! reason for each change. [`write_snapshot`] stores the compact JSON from
+//! [`crate::to_json`].
 
 use crate::Error;
 use crate::inbox::{Build, Enrichment, ReviewStatus, Reviewer, Row};

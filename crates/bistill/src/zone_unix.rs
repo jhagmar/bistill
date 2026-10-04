@@ -1,6 +1,7 @@
-//! The OS zone offset.
+//! The local time-zone offset on Unix.
 //!
-//! `std` has no local-time offset. `localtime_r` is the wrapper.
+//! The standard library does not report that offset. `localtime_r` is the
+//! small wrapper that does.
 
 #![allow(unsafe_code)]
 

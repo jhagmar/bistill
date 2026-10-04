@@ -1,4 +1,4 @@
-//! Display width of Unicode text.
+//! How many columns a piece of Unicode text takes on screen.
 
 #[path = "width_table.rs"]
 mod width_table;

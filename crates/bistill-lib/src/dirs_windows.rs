@@ -1,4 +1,4 @@
-//! `%APPDATA%` and `%LOCALAPPDATA%`.
+//! Where config and state live on Windows: `%APPDATA%` and `%LOCALAPPDATA%`.
 
 use crate::{ConfigFault, Error};
 use std::path::PathBuf;

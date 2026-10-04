@@ -1,7 +1,8 @@
-//! Immediate-mode terminal widgets.
+//! Widgets for a terminal screen that is drawn again each frame.
 //!
-//! The application keeps the state. Each frame draws a [`Buffer`] and a
-//! backend presents the cells that changed. This crate has no Bistill types.
+//! The application holds the state. Each frame fills a [`Buffer`], and a
+//! backend writes the cells that changed. This crate does not know about
+//! Bitbucket or bistill.
 
 #![deny(unsafe_code)]
 

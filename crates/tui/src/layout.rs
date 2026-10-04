@@ -1,4 +1,4 @@
-//! Rectangles and splits.
+//! Rectangles on the screen, and how to split one into pieces.
 
 /// A region of cells. `x` and `y` are the top-left column and row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

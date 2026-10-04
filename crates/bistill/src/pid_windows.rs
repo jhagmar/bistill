@@ -1,7 +1,7 @@
-//! Whether a pid is running on Windows.
+//! Whether a process id is still running on Windows.
 //!
-//! `std` cannot query a process. The `unsafe` block is the wrapper around
-//! `OpenProcess`.
+//! The standard library cannot ask that. The `unsafe` block is the small
+//! wrapper around `OpenProcess`.
 
 #![allow(unsafe_code)]
 

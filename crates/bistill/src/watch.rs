@@ -1,13 +1,15 @@
-//! `bistill watch` polls on the calling thread.
+//! `bistill watch` polls on the thread that called it.
 //!
-//! The holder writes `snapshot.json`, diffs it, and notifies. A live pid in
-//! `poll.lock` makes this process exit 1. Failures keep the last rows, record
-//! the snapshot status, and wait. The wait starts at `poll_seconds` (already
-//! at least 15), doubles, and stops at 10 minutes. HTTP 429 uses `Retry-After`
-//! when that delay is present. A `refresh` file is deleted within about a
-//! second and the next poll is not sooner than `poll_seconds` after the last one.
+//! The process that holds the lock writes `snapshot.json`, compares it with
+//! the previous copy, and sends notifications. If `poll.lock` already names a
+//! live process, this one exits 1. When a poll fails, the last rows stay, the
+//! snapshot records why, and the loop waits. The wait starts at
+//! `poll_seconds` (at least 15 seconds), doubles, and stops growing at 10
+//! minutes. HTTP 429 uses `Retry-After` when the response includes it. A
+//! `refresh` file is removed within about a second, and the next poll still
+//! waits until `poll_seconds` after the previous one.
 //!
-//! [`Board`] is the value the screen draws while this loop runs.
+//! [`Board`] is what the screen draws while this loop runs.
 
 use crate::lock::{self, Acquire};
 use crate::{Session, explain, send_notices};

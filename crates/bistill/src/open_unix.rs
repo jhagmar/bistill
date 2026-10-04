@@ -1,4 +1,4 @@
-//! Open a pull request with `xdg-open`.
+//! Open a pull request in the browser with `xdg-open`.
 
 use std::time::Duration;
 

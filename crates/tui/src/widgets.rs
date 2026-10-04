@@ -1,7 +1,8 @@
-//! Block, list, table, paragraph, tabs, and one-line input.
+//! A bordered block, a list, a table, a paragraph, tabs, and a one-line input.
 //!
-//! The application owns selection, scroll, and the input value. These
-//! functions draw that state and update it.
+//! The application keeps the selection, the scroll position, and the text
+//! being edited. These functions draw that state and update it when the
+//! caller asks.
 
 use crate::buffer::{Buffer, Span};
 use crate::layout::Rect;
