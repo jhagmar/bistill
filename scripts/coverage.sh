@@ -53,4 +53,10 @@ awk '
     }
   }
 ' target/cov-prof/report.txt
+# shellcheck disable=SC2086
+"$tools/llvm-cov" export "$first" $objects \
+  --format=lcov \
+  --instr-profile=target/cov-prof/all.profdata \
+  --ignore-filename-regex='tests\.rs' \
+  > lcov.info
 echo "line coverage 100%"

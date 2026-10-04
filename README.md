@@ -7,6 +7,14 @@ pull requests you authored. An OS notification when that list changes. The
 review is written on Bitbucket. It runs on the laptop that can already reach
 Bitbucket, as you, with your token.
 
+[![CI](https://github.com/jhagmar/bistill/actions/workflows/ci.yml/badge.svg)](https://github.com/jhagmar/bistill/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/jhagmar/bistill/actions/workflows/codeql.yml/badge.svg)](https://github.com/jhagmar/bistill/actions/workflows/codeql.yml)
+[![codecov](https://codecov.io/gh/jhagmar/bistill/graph/badge.svg)](https://codecov.io/gh/jhagmar/bistill)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jhagmar/bistill/badge)](https://scorecard.dev/viewer/?uri=github.com/jhagmar/bistill)
+[![REUSE status](https://api.reuse.software/badge/github.com/jhagmar/bistill)](https://api.reuse.software/info/github.com/jhagmar/bistill)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+
 ## ping
 
 `bistill ping` checks that curl can reach Bitbucket and prints the server
@@ -29,9 +37,7 @@ applied. When a pull request in that snapshot changes, `ls` sends one
 notification for it. The title is `Bistill`. The body names the pull request,
 the reasons, and the link. A pull request that left the inbox is named
 `merged` or `declined` when that pull request's state says so. If the read
-fails, the notification says merged or declined. If `notify-send` is
-missing, `ls` logs
-that once and still prints the list.
+fails, the notification says merged or declined. If `notify-send` is missing, `ls` logs that once and still prints the list.
 
 ```
 bistill ls --url https://git.example.invalid --user jcitizen
@@ -63,8 +69,18 @@ setup, including a Startup shortcut, is in `docs/windows.md`.
 
 ## Build
 
-MSRV is 1.85. Edition 2024.
+MSRV is 1.85. Edition 2024. CI runs on Rust 1.85.0.
 
 ```
 cargo test --workspace --locked
 ```
+
+The same checks as GitHub, including REUSE, run in Docker. See [ci/README.md](ci/README.md). Host commands are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+See [SECURITY.md](SECURITY.md).
+
+## License
+
+MIT. Copyright (c) 2026 Jonas Hagmar.

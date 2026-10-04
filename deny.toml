@@ -1,0 +1,15 @@
+[advisories]
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = ["MIT"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = []

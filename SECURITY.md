@@ -1,6 +1,11 @@
-# Security
+# Security policy
 
-Report a vulnerability by email to jonas.hagmar@protonmail.com.
+## Supported versions
 
-Describe the affected path and the impact. You will get an acknowledgement.
-A public issue or pull request is for fixes that are already disclosed.
+The latest commit on `master` receives security fixes.
+
+## Reporting a vulnerability
+
+Email jonas.hagmar@protonmail.com. Include the affected path and a way to reproduce.
+
+You will receive an acknowledgement within 7 days. A fix or a reasoned status update follows within 30 days. Do not open a public issue for an unfixed vulnerability.

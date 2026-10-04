@@ -1,12 +1,15 @@
 [package]
 name = "bistill-lib"
 description = "Config, errors, ping, inbox classification, and list snapshots."
+authors.workspace = true
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-host = { path = "../host" }
-json = { path = "../json" }
+host = { workspace = true }
+json = { workspace = true }
