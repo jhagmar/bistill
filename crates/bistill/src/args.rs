@@ -1,4 +1,4 @@
-//! Hand-rolled argv for `bistill ping`, `bistill ls`, and `bistill watch`.
+//! Parse the command line for `ping`, `ls`, and `watch`.
 
 use bistill_lib::Flags;
 use std::ffi::OsString;

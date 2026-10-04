@@ -1,7 +1,7 @@
-//! Draw a buffer and read one event.
+//! Draw a buffer and read one input event.
 //!
-//! [`TestBackend`] keeps the grid in memory and returns queued events without
-//! sleeping. `timeout` is the caller's bound.
+//! [`TestBackend`] keeps the grid in memory and returns events you queued,
+//! without sleeping. `timeout` is how long the caller is willing to wait.
 
 use crate::buffer::{Buffer, Cell};
 use crate::layout::Rect;

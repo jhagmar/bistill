@@ -1,11 +1,11 @@
-//! `bistill ping`, `bistill ls`, `bistill watch`, and the inbox screen.
+//! The `bistill` command: `ping`, `ls`, `watch`, and the inbox screen.
 //!
-//! `ping` lists the curl version, TLS, the Bitbucket version, the user, and
-//! the inbox count. `ls` prints the two inbox sections and notifies when the
-//! snapshot changes. `watch` holds `poll.lock` and polls on this thread.
-//! With no subcommand, a terminal on stdout runs that poller on a thread and
-//! draws the screen. `--json` prints the raw bodies for `ping` and the
-//! snapshot for `ls`.
+//! `ping` prints the curl version, whether TLS worked, the Bitbucket version,
+//! who you are, and the inbox count. `ls` prints the two sections and sends a
+//! notification when the snapshot changed. `watch` takes `poll.lock` and polls
+//! on this thread. With no subcommand, a terminal on stdout runs that poller
+//! on a background thread and draws the screen. `--json` prints the raw bodies
+//! for `ping`, and the snapshot for `ls`.
 
 #![deny(unsafe_code)]
 

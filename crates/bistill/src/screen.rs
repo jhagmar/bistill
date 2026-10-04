@@ -2,9 +2,9 @@
 
 //! The inbox screen.
 //!
-//! One view: tabs, the pull-request table, the detail pane, and a footer.
-//! At 100 columns the table and the detail sit side by side. Below that the
-//! table is above the detail.
+//! The view is the tabs, the pull-request table, the detail pane, and a
+//! footer. At 100 columns or more, the table and the detail sit side by side.
+//! Narrower than that, the table is above the detail.
 
 use bistill_lib::{Build, Enrichment, ReviewStatus, Row, Section, Snapshot};
 use tui::{

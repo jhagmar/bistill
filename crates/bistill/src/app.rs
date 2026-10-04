@@ -1,9 +1,10 @@
-//! The inbox process.
+//! The inbox while it is on screen.
 //!
-//! A free lock starts the poller on a thread and draws [`crate::screen`]. A
-//! live pid draws the snapshot file, names that pid, and writes `refresh`
-//! when the user presses `r`. `q` returns. The caller drops the terminal,
-//! which restores the previous screen.
+//! If the lock is free, this starts the poller on a thread and draws
+//! [`crate::screen`]. If another live process already holds the lock, this
+//! draws `snapshot.json`, shows that process id, and writes `refresh` when
+//! you press `r`. `q` returns. The caller then drops the terminal, which puts
+//! the previous screen back.
 
 use crate::lock::{self, Acquire};
 use crate::screen::{self, Action, Clock, Phase, Role, Screen};

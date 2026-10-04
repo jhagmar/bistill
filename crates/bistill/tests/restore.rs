@@ -1,4 +1,4 @@
-//! `q` on a pseudoterminal restores the previous screen.
+//! Pressing `q` on a pseudoterminal puts the previous screen back.
 
 use std::fs;
 use std::process::Command;

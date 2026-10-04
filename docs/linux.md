@@ -8,7 +8,7 @@ Follow the token and config steps in the [README](../README.md). The token file 
 
 ## Keep the poller running
 
-`bistill watch` polls and sends notifications. The binary does not install a service. A user service does that:
+`bistill watch` polls and sends notifications. bistill will not install a service for you. Save this as a user service:
 
 ```
 # ~/.config/systemd/user/bistill.service

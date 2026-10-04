@@ -1,4 +1,4 @@
-//! Open a pull request with PowerShell.
+//! Open a pull request in the browser with PowerShell.
 
 use std::time::Duration;
 

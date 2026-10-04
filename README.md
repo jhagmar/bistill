@@ -10,21 +10,21 @@ The Bitbucket list you were missing.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 
-Bitbucket already knows which pull requests need your review, and which open pull requests you wrote. That inbox is easy to leave closed. bistill keeps the same list on the laptop that can already reach your team's Bitbucket, signed in as you, and sends a notification when the list changes. You write the review on Bitbucket. Every request bistill makes is a read.
+bistill lists the Bitbucket pull requests that need your review, and the open pull requests you created. It runs on your computer, uses your HTTP access token, and can notify you when that list changes. You do the actual review in Bitbucket. bistill only sends read requests.
 
-One process polls. A terminal shows the list. A notification names the pull request, why it changed, and the link.
+Run it in a terminal when you want to look at the list. Leave `bistill watch` running if you want a notification that names the pull request, says what changed, and includes the link.
 
 ## What you need
 
 `curl` on Linux, or `curl.exe` on Windows, must be on `PATH`. bistill uses it for every request and checks TLS with the operating system's trust store. Each request waits up to 15 seconds.
 
-You also need an HTTP access token that can read pull requests on that server. The token stays in this process. It is never printed. With `--verbose`, the log shows `Authorization: Bearer ***`.
+You also need an HTTP access token that can read pull requests on that server. bistill keeps the token in memory and does not print it. If you pass `--verbose`, the log shows `Authorization: Bearer ***`.
 
 ## Set it up
 
 bistill looks for configuration in this order: `--config PATH`, then `./bistill.conf` in the current directory, then the user config file. On Linux that file is `$XDG_CONFIG_HOME/bistill/config`, which is `~/.config/bistill/config` when `XDG_CONFIG_HOME` is unset. On Windows it is `%APPDATA%\bistill\config`.
 
-The file is UTF-8 text, one `key = value` per line. A `#` starts a comment. Write paths in full. A leading `~` stays as those two characters.
+The file is UTF-8 text, one `key = value` per line. A `#` starts a comment. Write paths out in full. bistill does not expand `~`, so `~/...` is not your home directory.
 
 ```
 base_url = https://git.example.invalid
@@ -42,9 +42,9 @@ umask 077
 printf '%s\n' 'paste-the-token-here' > ~/.config/bistill/token
 ```
 
-On Windows, give that file access only to your user account. bistill does not read the ACL. It still expects the file to be private.
+On Windows, limit the token file to your user account. bistill does not read the ACL, so set that permission yourself.
 
-A flag overrides an environment variable, and an environment variable overrides the file. `BISTILL_URL`, `BISTILL_USER`, `BISTILL_TOKEN`, and `BISTILL_TOKEN_FILE` are the variables. When `BISTILL_TOKEN` is set, bistill uses it and leaves the token file unread.
+If the same setting appears in more than one place, the flag wins, then the environment variable, then the file. The variables are `BISTILL_URL`, `BISTILL_USER`, `BISTILL_TOKEN`, and `BISTILL_TOKEN_FILE`. If `BISTILL_TOKEN` is set, bistill uses that value.
 
 Check the connection before you rely on the list:
 
@@ -95,7 +95,7 @@ On Windows the notification is a PowerShell toast. A click opens the pull reques
 
 `bistill watch` is the same poller without a screen. Leave it running and you get the notifications while you work. A second `bistill watch` exits 1 and names the process that already holds the lock. If that process is gone, the lock file is free and the next `watch` takes it.
 
-Run `bistill` in a terminal while `watch` is already running and this terminal only displays the list. It re-reads `snapshot.json` about once a second. Polling and notifications stay with the first process. `r` in that window asks the poller to fetch again.
+If `watch` is already running and you start `bistill` in a terminal, that window shows the list and re-reads `snapshot.json` about once a second. The first process keeps polling and sending notifications. Press `r` in the window when you want it to fetch again.
 
 Linux setup for a user service is in [docs/linux.md](docs/linux.md). Windows setup for a Startup shortcut is in [docs/windows.md](docs/windows.md).
 

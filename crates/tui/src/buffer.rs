@@ -1,4 +1,4 @@
-//! A grid of cells.
+//! The grid of cells that one frame draws into.
 
 use crate::style::Style;
 use crate::width::char_width;

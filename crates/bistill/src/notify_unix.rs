@@ -1,4 +1,4 @@
-//! Linux desktop notification.
+//! A desktop notification on Linux, sent with `notify-send`.
 
 use std::time::Duration;
 

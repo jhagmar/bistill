@@ -1,7 +1,7 @@
-//! Unicode 16.0.0 ranges for display width.
+//! Unicode 16.0.0 ranges used to decide display width.
 //!
-//! Wide and fullwidth come from East Asian Width. Combining marks are general
-//! categories Mn and Me.
+//! Wide and fullwidth come from East Asian Width. Combining marks are the
+//! general categories Mn and Me.
 
 #[rustfmt::skip]
 pub(crate) const WIDE: &[(u32, u32)] = &[

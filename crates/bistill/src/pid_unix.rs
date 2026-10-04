@@ -1,4 +1,4 @@
-//! Whether a pid is running on Linux.
+//! Whether a process id is still running on Linux.
 
 use std::path::Path;
 

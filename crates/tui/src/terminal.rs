@@ -1,8 +1,8 @@
-//! The process terminal.
+//! The terminal this process is attached to.
 //!
-//! [`Terminal`] enters the alternate screen and raw mode. Drop restores the
-//! previous screen and console mode. A panic runs that restore before
-//! unwinding.
+//! [`Terminal`] switches to the alternate screen and raw mode. When it is
+//! dropped, the previous screen and console mode come back. A panic runs
+//! that restore before the stack unwinds.
 
 use crate::backend::{Backend, Event, KeyCode, MouseButton, Wheel};
 use crate::buffer::{Buffer, Glyph};

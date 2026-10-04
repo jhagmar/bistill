@@ -1,8 +1,8 @@
-//! Activities, blocker comments, build-status, and merge for one pull request.
+//! Extra detail for one pull request: activity, open tasks, build status, and merge.
 //!
-//! The list calls [`fetch`] once per enriched row. A 404 on build-status leaves
-//! `build` at `none`. `count=true` on blocker comments falls back to paging
-//! when the server answers 400.
+//! The list calls [`fetch`] once for each pull request it is filling in. A 404
+//! on build status leaves `build` as `none`. If `count=true` on blocker
+//! comments comes back HTTP 400, the code pages through the comments instead.
 
 use std::cmp::Ordering;
 

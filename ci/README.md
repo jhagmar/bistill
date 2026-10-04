@@ -7,7 +7,7 @@ docker compose run --rm ci
 docker compose run --rm codeql
 ```
 
-`compose.yaml` builds `ci/Dockerfile` and mounts this tree at `/src`. The image pins the same tools GitHub uses, so your laptop and the pull request run one procedure.
+`compose.yaml` builds `ci/Dockerfile` and mounts this tree at `/src`. The image installs the same tool versions GitHub uses, so the commands below match the pull request checks.
 
 ## The test job
 

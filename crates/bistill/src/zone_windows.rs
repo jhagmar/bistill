@@ -1,6 +1,7 @@
-//! The OS zone offset.
+//! The local time-zone offset on Windows.
 //!
-//! `std` has no local-time offset. `GetTimeZoneInformation` is the wrapper.
+//! The standard library does not report that offset. `GetTimeZoneInformation`
+//! is the small wrapper that does.
 
 #![allow(unsafe_code)]
 

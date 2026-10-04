@@ -1,7 +1,8 @@
-//! `poll.lock` is one decimal pid.
+//! `poll.lock` holds one process id, in decimal.
 //!
-//! The file is created exclusively. A live pid keeps it. Any other contents
-//! leave the file free for the next process. Drop removes the file.
+//! The file is created so that only one process can create it. A live process
+//! id means that process is the poller. Anything else means the next process
+//! may take the file. Dropping the lock removes the file.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
