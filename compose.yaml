@@ -1,0 +1,42 @@
+# Local required checks. From this directory, with Docker running:
+#
+#   docker compose run --rm ci
+#   docker compose run --rm codeql
+
+name: bistill
+
+services:
+  ci:
+    build:
+      context: .
+      dockerfile: ci/Dockerfile
+      target: ci
+    working_dir: /src
+    volumes:
+      - .:/src
+      - ci-cargo-registry:/opt/cargo/registry
+      - ci-cargo-git:/opt/cargo/git
+      - ci-target:/src/target
+    command: ["/src/ci/entrypoint.sh"]
+
+  codeql:
+    build:
+      context: .
+      dockerfile: ci/Dockerfile
+      target: codeql
+    working_dir: /src
+    volumes:
+      - .:/src
+      - ./ci/out:/out
+      - codeql-cargo-registry:/opt/cargo/registry
+      - codeql-cargo-git:/opt/cargo/git
+      - codeql-target:/tmp/cargo-target
+    command: ["/src/ci/codeql.sh"]
+
+volumes:
+  ci-cargo-registry:
+  ci-cargo-git:
+  ci-target:
+  codeql-cargo-registry:
+  codeql-cargo-git:
+  codeql-target:

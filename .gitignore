@@ -1,1 +1,11 @@
+.DS_Store
+.idea/
+*.swp
+.env
+.env.*
+!.env.example
 /target
+coverage/
+*.lcov
+lcov.info
+ci/out/
