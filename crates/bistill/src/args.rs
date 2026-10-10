@@ -1,4 +1,4 @@
-//! Parse the command line for `ping`, `ls`, and `watch`.
+//! Parse the command line for `ping` and `tui`.
 
 use bistill_lib::Flags;
 use std::ffi::OsString;
@@ -6,8 +6,7 @@ use std::path::PathBuf;
 
 const USAGE: &str = "\
 Usage: bistill ping [--json] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
-       bistill ls [--json] [--count] [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
-       bistill watch [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
+       bistill tui [--url URL] [--user SLUG] [--token-file PATH] [--config PATH] [--verbose]
 ";
 
 /// What to run.
@@ -16,10 +15,8 @@ pub(crate) enum Command {
     Help,
     /// `ping`.
     Ping(Ping),
-    /// `ls`.
-    Ls(Ls),
-    /// `watch`.
-    Watch(Watch),
+    /// `tui`, the inbox process.
+    Tui(Tui),
 }
 
 /// Flags for `ping`.
@@ -33,22 +30,9 @@ pub(crate) struct Ping {
     pub flags: Flags,
 }
 
-/// Flags for `ls`.
+/// Flags for `tui`.
 #[derive(Default)]
-pub(crate) struct Ls {
-    /// `--json`.
-    pub json: bool,
-    /// `--count`.
-    pub count: bool,
-    /// `--verbose`.
-    pub verbose: bool,
-    /// Config overrides.
-    pub flags: Flags,
-}
-
-/// Flags for `watch`.
-#[derive(Default)]
-pub(crate) struct Watch {
+pub struct Tui {
     /// `--verbose`.
     pub verbose: bool,
     /// Config overrides.
@@ -57,8 +41,7 @@ pub(crate) struct Watch {
 
 enum Kind {
     Ping,
-    Ls,
-    Watch,
+    Tui,
 }
 
 /// Why argv was rejected.
@@ -73,6 +56,18 @@ pub(crate) enum Usage {
     NotUtf8,
 }
 
+pub(crate) fn tui_request(args: &[OsString]) -> Option<Result<Tui, Usage>> {
+    if args.len() <= 1 {
+        return Some(Ok(Tui::default()));
+    }
+    let first = args.get(1).and_then(|arg| arg.to_str());
+    match parse(args) {
+        Ok(Command::Tui(tui)) => Some(Ok(tui)),
+        Err(usage) if first == Some("tui") => Some(Err(usage)),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
     let mut iter = args.iter().skip(1);
     let Some(first) = iter.next() else {
@@ -83,15 +78,12 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
     }
     let kind = if first == "ping" {
         Kind::Ping
-    } else if first == "ls" {
-        Kind::Ls
-    } else if first == "watch" {
-        Kind::Watch
+    } else if first == "tui" {
+        Kind::Tui
     } else {
         return Err(Usage::Unknown);
     };
     let mut json = false;
-    let mut count = false;
     let mut verbose = false;
     let mut flags = Flags::default();
     while let Some(arg) = iter.next() {
@@ -100,8 +92,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
         }
         let name = arg.to_str().ok_or(Usage::NotUtf8)?;
         match name {
-            "--json" if !matches!(kind, Kind::Watch) => json = true,
-            "--count" if matches!(kind, Kind::Ls) => count = true,
+            "--json" if matches!(kind, Kind::Ping) => json = true,
             "--verbose" => verbose = true,
             "--url" => flags.base_url = Some(value(&mut iter, "--url")?),
             "--user" => flags.username = Some(value(&mut iter, "--user")?),
@@ -118,13 +109,7 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Command, Usage> {
             verbose,
             flags,
         })),
-        Kind::Ls => Ok(Command::Ls(Ls {
-            json,
-            count,
-            verbose,
-            flags,
-        })),
-        Kind::Watch => Ok(Command::Watch(Watch { verbose, flags })),
+        Kind::Tui => Ok(Command::Tui(Tui { verbose, flags })),
     }
 }
 
@@ -146,8 +131,7 @@ pub(crate) fn help_text() -> String {
     format!(
         "\
 {USAGE}\
---json prints the raw bodies for ping, and the snapshot for ls.
---count prints how many pull requests need you.
+--json prints the raw bodies for ping.
 --url sets the Bitbucket origin.
 --user sets the username.
 --token-file sets the token file.
@@ -160,7 +144,7 @@ pub(crate) fn help_text() -> String {
 
 pub(crate) fn usage_text(usage: &Usage) -> String {
     let reason = match usage {
-        Usage::Bare => "Run ping, ls, or watch.".to_owned(),
+        Usage::Bare => "Run ping, or start the inbox with bistill tui.".to_owned(),
         Usage::Unknown => "Unknown argument.".to_owned(),
         Usage::NeedsValue(flag) => format!("{flag} needs a value."),
         Usage::NotUtf8 => "The argument must be UTF-8.".to_owned(),

@@ -10,9 +10,9 @@ The Bitbucket list you were missing.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
 
-bistill lists the Bitbucket pull requests that need your review, and the open pull requests you created. It runs on your computer, uses your HTTP access token, and can notify you when that list changes. You do the actual review in Bitbucket. bistill only sends read requests.
+bistill lists the Bitbucket pull requests that need your review, and the open pull requests you created. It runs on your computer and uses your HTTP access token. You do the actual review in Bitbucket. bistill only sends read requests.
 
-Run it in a terminal when you want to look at the list. Leave `bistill watch` running if you want a notification that names the pull request, says what changed, and includes the link.
+Open a terminal and leave `bistill` running. That process polls, draws the inbox, and shows an unread count on a tray icon.
 
 ## What you need
 
@@ -56,17 +56,23 @@ A successful `ping` prints the curl version, confirms TLS, and then prints the B
 
 ## Day to day
 
-Open a terminal and run `bistill` with no subcommand. That is the inbox. The screen has two sections, **Needs review** and **Waiting**. Needs review holds pull requests where you are a reviewer and still have something to do. Waiting holds open pull requests you authored, and reviews where you are already done and the next step belongs to someone else.
+Open a terminal and run `bistill`, or `bistill tui`. That is the inbox. A second `bistill` exits 1 and names the process that already holds the lock. The screen has two sections, **Needs review** and **Waiting**. Needs review holds open pull requests where you are a reviewer, including ones you have already approved. Waiting holds open pull requests you wrote. If you are both the author and a reviewer, the row stays under Needs review.
 
-On a wide terminal the table and the detail sit side by side. On a narrow one the table is above the detail. The bottom line is the status. An empty inbox says "Nothing needs your attention."
+On a wide terminal the table and the detail sit side by side. On a narrow one the table is above the detail. The bottom line is the status and the keys that apply right now. An empty inbox says "Nothing needs your attention."
 
-The first 50 pull requests, oldest update first, include unanswered threads, open tasks, the build, and whether the pull request can merge. Further rows stay in the list. When there are more than 50, the detail starts with "and N more".
+The detail lists activity newest first: the time, the person, a short verb, and the comment or commit subject. A line you have not caught up to starts with `new`. Selecting a row, or pressing `m`, marks that pull request read. Press `i` on a Needs review row to ignore it. An ignored row shows the badge `ignored` and stays out of the tray count. Opening the pull request in the browser does not mark it read.
 
-Press `q` to leave. The terminal returns to the screen you had before.
+The tray icon's tooltip is the number of unread pull requests. Activating the icon raises this terminal. On Linux the icon is a status notifier item. On Windows it is a notification-area icon. If no status-icon watcher is running, bistill writes that to the log once and keeps polling.
+
+The process writes `snapshot.json` as each reply arrives, and `watermarks.json` when you catch up or ignore a row. Both files live in the state directory, `~/.local/state/bistill` on Linux (or `$XDG_STATE_HOME/bistill`) and `%LOCALAPPDATA%\bistill` on Windows. The first successful poll marks the current inbox read, so pull requests that were already there do not light the tray. Later events do.
+
+Press `q` to leave. The terminal returns to the screen you had before, and the tray icon goes away.
 
 | Key | What it does |
 | --- | --- |
-| `j` / `k` or arrows | Move the selection |
+| `j` / `k` or arrows | Move the selection and mark that pull request read |
+| `m` | Mark the selected pull request read |
+| `i` | Ignore a Needs review row, or count it in the tray again |
 | Enter | Open the pull request |
 | `r` | Ask for a fetch. It starts once the poll interval has passed since the last one |
 | `/` | Filter by title, repository, or author. The match ignores case. Escape cancels. Enter applies. Enter on an empty line clears the filter |
@@ -74,30 +80,9 @@ Press `q` to leave. The terminal returns to the screen you had before.
 | `?` | Show these keys |
 | `q` | Quit and restore the terminal |
 
-A click selects the row under the pointer. The wheel scrolls the pane that has focus. A second click on the same row within 400 milliseconds opens the pull request.
+A click selects the row under the pointer and marks it read. The wheel scrolls the pane that has focus. A second click on the same row within 400 milliseconds opens the pull request.
 
-`bistill ls` prints the same two sections and exits. An empty list prints "Nothing needs your attention." and exits 0. `--count` prints how many pull requests need you: everything under Needs review, plus Waiting rows that have an unanswered author thread or an open task. `--json` prints the snapshot.
-
-```
-bistill ls --url https://git.example.invalid --user jcitizen
-```
-
-`ls` and the background poller both write `snapshot.json` as each reply arrives. The file lives in the state directory, `~/.local/state/bistill` on Linux (or `$XDG_STATE_HOME/bistill`) and `%LOCALAPPDATA%\bistill` on Windows. After a restart, bistill compares the new list with that file, so a pull request you already knew about stays quiet.
-
-When a pull request in the snapshot changes, you get one notification. The title is `Bistill`. The body names the pull request, the reason, and the link. A pull request that left the inbox is called merged or declined when bistill can read that pull request's state. When that read fails, the notification still says merged or declined.
-
-```
-notify-send --expire-time 10000 -- Bistill "PRJ/repo#12 needs review
-https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/12"
-```
-
-On Windows the notification is a PowerShell toast. A click opens the pull request.
-
-`bistill watch` is the same poller without a screen. Leave it running and you get the notifications while you work. A second `bistill watch` exits 1 and names the process that already holds the lock. If that process is gone, the lock file is free and the next `watch` takes it.
-
-If `watch` is already running and you start `bistill` in a terminal, that window shows the list and re-reads `snapshot.json` about once a second. The first process keeps polling and sending notifications. Press `r` in the window when you want it to fetch again.
-
-Linux setup for a user service is in [docs/linux.md](docs/linux.md). Windows setup for a Startup shortcut is in [docs/windows.md](docs/windows.md).
+Linux tray notes are in [docs/linux.md](docs/linux.md). Windows notes are in [docs/windows.md](docs/windows.md).
 
 While a fetch is in progress the status line says "Fetching from Bitbucket..." and the rows you already have stay on screen. A rejected token says "Token rejected." A TLS failure says "curl failed TLS." A server you cannot reach says "Bitbucket unreachable (since …)." Too many requests says "Rate limited." The poller keeps the last rows and tries again. The wait starts at your poll interval, at least 15 seconds, doubles after each failure, and stops at 10 minutes. A rate-limit response can name its own wait.
 
@@ -111,17 +96,17 @@ While a fetch is in progress the status line says "Fetching from Bitbucket..." a
 | `poll_seconds` | How often to poll. Default 60. A value below 15 is treated as 15 |
 | `stale_days` | A Waiting row older than this shows the badge `stale`. Default 7 |
 | `ca_file` | PEM file for a private certificate authority. Unset means the operating system trust store |
-| `log_file` | Where warnings and errors are written. Unset means stderr for `ping`, `ls`, and `watch`. The inbox keeps those lines off the screen and shows status in the footer |
-| `state_dir` | Where `snapshot.json` and the lock live. Default as above |
+| `log_file` | Where warnings and errors are written. Unset means stderr for `ping`. The inbox keeps those lines off the screen and shows status in the footer |
+| `state_dir` | Where `snapshot.json`, `watermarks.json`, and the lock live. Default as above |
 
-`ping`, `ls`, and `watch` accept `--config` and `--verbose`. `ping` also accepts `--url`, `--user`, `--token-file`, and `--json`. `ls` also accepts `--json` and `--count`. `bistill --help` lists them.
+`ping` and `tui` accept `--url`, `--user`, `--token-file`, `--config`, and `--verbose`. `ping` also accepts `--json`. `bistill --help` lists them.
 
 ## When a command fails
 
 | Exit | Cause |
 | --- | --- |
 | 0 | Success, including an empty inbox |
-| 1 | Usage, configuration, or a `watch` lock already held |
+| 1 | Usage, configuration, or another bistill already holds the lock |
 | 2 | `curl` or `curl.exe` is missing from `PATH` |
 | 3 | TLS verification failed |
 | 4 | The request timed out |
@@ -131,7 +116,7 @@ While a fetch is in progress the status line says "Fetching from Bitbucket..." a
 | 13 | HTTP 404 |
 | 10 | Any other HTTP status |
 
-Running `bistill` with output that is not a terminal prints "Run ping, ls, or watch." and exits 1.
+Running `bistill` with output that is not a terminal prints "Run ping, or start the inbox with bistill tui." and exits 1. `bistill tui` with output that is not a terminal prints "Open a terminal to start the inbox." and exits 1.
 
 ## Build
 
@@ -141,7 +126,7 @@ The minimum supported Rust is 1.85. The edition is 2024. GitHub runs the checks 
 cargo test --workspace --locked
 ```
 
-The release binary is `target/release/bistill` after `cargo build --release -p bistill`. Put that directory on `PATH`, or use the full path in the service and the shortcut.
+The release binary is `target/release/bistill` after `cargo build --release -p bistill`. Put that directory on `PATH`.
 
 To run the same checks as GitHub on your machine, see [ci/README.md](ci/README.md). Contributor setup is in [CONTRIBUTING.md](CONTRIBUTING.md).
 

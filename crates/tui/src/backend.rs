@@ -93,7 +93,7 @@ pub enum Event {
 }
 
 /// A surface that presents a buffer and yields events.
-pub trait Backend {
+pub trait Backend: Send {
     /// The grid size in cells.
     fn size(&self) -> Rect;
     /// Present `buffer`. Cells equal to the previous frame stay as they were.

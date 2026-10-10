@@ -536,10 +536,10 @@ fn block_draws_a_focused_border_and_title() {
         plain,
         focused,
     );
-    assert_eq!(symbol(&buffer, 0, 0), "+");
+    assert_eq!(symbol(&buffer, 0, 0), "╭");
     assert_eq!(row_text(&buffer, 1, 0, 8), "Needs r…");
     assert!(!buffer.get(0, 1).unwrap().style.bold);
-    assert_eq!(symbol(&buffer, 0, 1), "|");
+    assert_eq!(symbol(&buffer, 0, 1), "│");
     draw_block(
         &mut buffer,
         rect(0, 0, 10, 4),
@@ -559,7 +559,18 @@ fn block_draws_a_focused_border_and_title() {
         focused,
     );
     assert_eq!(row_text(&buffer, 1, 0, 6), "Too l…");
-    assert_eq!(symbol(&buffer, 0, 1), "+");
+    assert_eq!(symbol(&buffer, 0, 1), "╰");
+    buffer.set_span(
+        2,
+        2,
+        &Span {
+            style: plain,
+            content: "Z",
+        },
+        1,
+    );
+    fill_rect(&mut buffer, rect(1, 1, 4, 2), plain);
+    assert_eq!(symbol(&buffer, 2, 2), " ");
     draw_block(&mut buffer, rect(0, 0, 1, 4), "x", false, plain, focused);
     let inside = inner(rect(2, 3, 6, 4));
     assert_eq!(inside, rect(3, 4, 4, 2));

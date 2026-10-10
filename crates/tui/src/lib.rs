@@ -28,7 +28,7 @@ pub use style::{Color, Style};
 pub use terminal::Terminal;
 pub use widgets::{
     Input, ListState, draw_block, draw_input, draw_list, draw_paragraph, draw_table, draw_tabs,
-    ensure_visible, hit_row, inner, position,
+    ensure_visible, fill_rect, hit_row, inner, position,
 };
 pub use width::{char_width, display_width, truncate};
 

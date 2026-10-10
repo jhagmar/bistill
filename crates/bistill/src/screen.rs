@@ -6,20 +6,29 @@
 //! footer. At 100 columns or more, the table and the detail sit side by side.
 //! Narrower than that, the table is above the detail.
 
-use bistill_lib::{Build, Enrichment, ReviewStatus, Row, Section, Snapshot};
+use bistill_lib::{Build, Enrichment, EventKind, ReviewStatus, Row, Section, Snapshot};
+use std::collections::{BTreeMap, BTreeSet};
 use tui::{
     Buffer, Constraint, Direction, Event, Input, KeyCode, ListState, Rect, Style, Wheel,
-    draw_block, draw_input, draw_paragraph, draw_table, draw_tabs, hit_row, inner, split,
+    draw_block, draw_input, draw_paragraph, draw_table, draw_tabs, fill_rect, hit_row, inner,
+    split,
 };
 
 const HELP: &str = "\
 j / k    Move the selection
 Enter    Open the pull request
+m        Mark this pull request read
+i        Ignore or watch a review
 r        Refresh
 /        Filter title, repo, and author
 Tab      Switch section
 ?        List the keys
 q        Quit";
+
+const LIST_KEYS: &str =
+    "j/k move  Enter open  m read  i ignore  r refresh  / filter  Tab section  ? help  q quit";
+const EDIT_KEYS: &str = "Enter apply  Esc cancel";
+const HELP_KEYS: &str = "? or Esc close  q quit";
 
 /// What one key or click did.
 #[derive(Debug, Eq, PartialEq)]
@@ -59,16 +68,20 @@ pub(crate) enum Phase {
     },
 }
 
+/// A key asked the watermark file to change.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum Pending {
+    /// Move this pull request's watermark to its newest event.
+    Read(String),
+    /// Toggle ignored on a Needs review row.
+    Ignore(String),
+}
+
 /// Who is drawing.
 #[derive(Eq, PartialEq)]
 pub(crate) enum Role {
     /// This process holds the lock.
     Holder(Phase),
-    /// Another live pid holds the lock.
-    Viewer {
-        /// The holder's pid.
-        pid: u32,
-    },
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -104,6 +117,12 @@ pub(crate) struct Screen {
     detail_window: usize,
     last_click: Option<(usize, u64)>,
     frame: Frame,
+    /// Activity id this pull request is caught up to. Missing means nothing is `new`.
+    floors: BTreeMap<String, u64>,
+    /// Reviewer rows left out of the tray count.
+    ignored: BTreeSet<String>,
+    /// Set by a key. The caller writes `watermarks.json` and clears it.
+    pending: Option<Pending>,
 }
 
 impl Default for Screen {
@@ -131,11 +150,26 @@ impl Screen {
             detail_window: 0,
             last_click: None,
             frame: Frame::default(),
+            floors: BTreeMap::new(),
+            ignored: BTreeSet::new(),
+            pending: None,
         }
+    }
+
+    /// The watermark edit from the last key, if there was one.
+    pub(crate) fn take_pending(&mut self) -> Option<Pending> {
+        self.pending.take()
+    }
+
+    /// Copy the watermark cursors the detail pane and the ignored badge use.
+    pub(crate) fn set_marks(&mut self, floors: BTreeMap<String, u64>, ignored: BTreeSet<String>) {
+        self.floors = floors;
+        self.ignored = ignored;
     }
 }
 
 /// Clock values the screen formats. `offset_secs` is the OS zone offset.
+#[derive(Clone, Copy)]
 pub(crate) struct Clock {
     /// Epoch milliseconds.
     pub now_ms: u64,
@@ -211,7 +245,7 @@ fn paint(
             plain,
         );
     } else {
-        let owned = table_cells(&rows, clock.now_ms);
+        let owned = table_cells(&rows, clock.now_ms, &screen.ignored);
         let views: Vec<[&str; 5]> = owned
             .iter()
             .map(|cell| {
@@ -236,7 +270,9 @@ fn paint(
             reverse,
         );
     }
-    let detail = chosen(&rows, active(screen)).map(|row| detail_text(row, clock.offset_secs));
+    let user_slug = snapshot.map(|item| item.user_slug.as_str()).unwrap_or("");
+    let detail = chosen(&rows, active(screen))
+        .map(|row| detail_text(row, user_slug, screen.floors.get(&row.id).copied(), clock));
     let mut detail = detail.unwrap_or_default();
     if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.truncated > 0) {
         detail.insert_str(0, &format!("and {} more\n", snapshot.truncated));
@@ -257,22 +293,72 @@ fn paint(
         marked,
     );
     draw_paragraph(buffer, frame.detail_inner, &shown, plain);
-    let status = footer(role, snapshot.is_some(), clock.offset_secs);
-    draw_line(buffer, frame.footer, &status, plain);
+    let status = footer(role, clock.offset_secs);
+    let keys = if screen.help {
+        HELP_KEYS
+    } else if screen.editing {
+        EDIT_KEYS
+    } else {
+        LIST_KEYS
+    };
+    let line = if status.is_empty() {
+        keys.to_owned()
+    } else {
+        format!("{status}  {keys}")
+    };
+    draw_line(buffer, frame.footer, &line, plain);
     if screen.editing {
+        let hint = u16::try_from(EDIT_KEYS.chars().count()).unwrap_or(0);
+        let input_width = frame.footer.width.saturating_sub(hint.saturating_add(2));
         draw_line(buffer, frame.footer, "/", plain);
         let field = Rect {
             x: frame.footer.x.saturating_add(1),
             y: frame.footer.y,
-            width: frame.footer.width.saturating_sub(1),
+            width: input_width,
             height: frame.footer.height,
         };
         draw_input(buffer, field, &screen.draft, plain);
+        draw_line(
+            buffer,
+            Rect {
+                x: field.x.saturating_add(input_width).saturating_add(1),
+                y: frame.footer.y,
+                width: hint,
+                height: frame.footer.height,
+            },
+            EDIT_KEYS,
+            plain,
+        );
     }
     if screen.help {
-        draw_block(buffer, full(buffer), "Keys", true, plain, marked);
-        draw_paragraph(buffer, inner(full(buffer)), HELP, plain);
+        draw_help(buffer, plain, marked);
     }
+}
+
+fn draw_help(buffer: &mut Buffer, plain: Style, marked: Style) {
+    let lines: Vec<&str> = HELP.lines().collect();
+    let inner_w = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = u16::try_from(inner_w)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(buffer.width());
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(buffer.height());
+    let area = Rect {
+        x: buffer.width().saturating_sub(width) / 2,
+        y: buffer.height().saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    fill_rect(buffer, area, plain);
+    draw_block(buffer, area, "Keys", true, plain, marked);
+    draw_paragraph(buffer, inner(area), HELP, plain);
 }
 
 /// Apply one event. `now_ms` is the click clock for a double-click.
@@ -327,6 +413,16 @@ fn command(screen: &mut Screen, event: Event, snapshot: Option<&Snapshot>, now_m
     match event {
         Event::Key(KeyCode::Char('q')) => Action::Quit,
         Event::Key(KeyCode::Char('r')) => Action::Refresh,
+        Event::Key(KeyCode::Char('m')) => {
+            note(screen, snapshot, true);
+            Action::None
+        }
+        Event::Key(KeyCode::Char('i')) => {
+            if screen.section == Section::NeedsReview {
+                note(screen, snapshot, false);
+            }
+            Action::None
+        }
         Event::Key(KeyCode::Char('?')) => {
             screen.help = true;
             Action::None
@@ -400,7 +496,22 @@ fn step(screen: &mut Screen, snapshot: Option<&Snapshot>, down: bool) {
         };
         state.selected = Some(next);
         state.reveal(len, window);
+        note(screen, snapshot, true);
     }
+}
+
+fn note(screen: &mut Screen, snapshot: Option<&Snapshot>, read: bool) {
+    let rows = visible(snapshot, screen.section, &screen.filter);
+    if let Some(row) = chosen(&rows, active(screen)) {
+        let id = row.id.clone();
+        let pending = if read {
+            Pending::Read(id)
+        } else {
+            Pending::Ignore(id)
+        };
+        screen.pending = Some(pending);
+    }
+    let _ = screen.pending.is_some();
 }
 
 fn open_selected(screen: &Screen, snapshot: Option<&Snapshot>) -> Action {
@@ -436,6 +547,7 @@ fn press(
         ) {
             Some(index) => {
                 active_mut(screen).selected = Some(index);
+                note(screen, snapshot, true);
                 let open = match screen.last_click {
                     Some((previous, at))
                         if previous == index && now_ms.saturating_sub(at) <= 400 =>
@@ -609,7 +721,7 @@ fn section_name(section: Section) -> &'static str {
     }
 }
 
-fn table_cells(rows: &[&Row], now_ms: u64) -> Vec<[String; 5]> {
+fn table_cells(rows: &[&Row], now_ms: u64, ignored: &BTreeSet<String>) -> Vec<[String; 5]> {
     rows.iter()
         .map(|row| {
             [
@@ -617,7 +729,7 @@ fn table_cells(rows: &[&Row], now_ms: u64) -> Vec<[String; 5]> {
                 row.title.clone(),
                 row.author.clone(),
                 relative(row.updated_ms, now_ms),
-                badges(row),
+                badges(row, ignored.contains(&row.id)),
             ]
         })
         .collect()
@@ -676,7 +788,7 @@ fn ymd(days: u64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-fn badges(row: &Row) -> String {
+fn badges(row: &Row, ignored: bool) -> String {
     let mut parts = Vec::new();
     if row.draft {
         parts.push("draft");
@@ -698,12 +810,25 @@ fn badges(row: &Row) -> String {
             parts.push("conflicted");
         }
     }
+    if ignored {
+        parts.push("ignored");
+    }
     parts.join(" ")
 }
 
-fn detail_text(row: &Row, offset_secs: i32) -> String {
+fn detail_text(row: &Row, user_slug: &str, floor: Option<u64>, clock: Clock) -> String {
     let mut lines = Vec::new();
     lines.push(row.title.clone());
+    let mut events = row.events.clone();
+    events.sort_by(|left, right| {
+        right
+            .id
+            .cmp(&left.id)
+            .then(right.created_ms.cmp(&left.created_ms))
+    });
+    for event in &events {
+        lines.push(event_line(event, user_slug, floor, clock.now_ms));
+    }
     for reviewer in &row.reviewers {
         lines.push(format!(
             "{} {}",
@@ -729,7 +854,7 @@ fn detail_text(row: &Row, offset_secs: i32) -> String {
             lines.push("mergeable".to_owned());
         }
     }
-    lines.push(absolute(row.updated_ms, offset_secs));
+    lines.push(absolute(row.updated_ms, clock.offset_secs));
     lines.push(row.html_url.clone());
     lines.join("\n")
 }
@@ -751,10 +876,37 @@ fn build_word(build: Build) -> Option<&'static str> {
     }
 }
 
-fn footer(role: &Role, loaded: bool, offset_secs: i32) -> String {
+fn event_line(
+    event: &bistill_lib::Event,
+    user_slug: &str,
+    floor: Option<u64>,
+    now_ms: u64,
+) -> String {
+    let verb = match event.kind {
+        EventKind::Commented => "commented",
+        EventKind::Approved => "approved",
+        EventKind::Pushed => "pushed",
+        EventKind::Reopened => "reopened",
+        EventKind::Added => "added you",
+        EventKind::Other => "updated",
+    };
+    let unread = floor.is_some_and(|floor| event.id > floor)
+        && !event.actor_slug.eq_ignore_ascii_case(user_slug);
+    let prefix = if unread { "new " } else { "" };
+    let subject = if event.text.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", event.text)
+    };
+    format!(
+        "{prefix}{} {} {verb}{subject}",
+        relative(event.created_ms, now_ms),
+        event.actor_name
+    )
+}
+
+fn footer(role: &Role, offset_secs: i32) -> String {
     match role {
-        Role::Viewer { .. } if !loaded => "Fetching from Bitbucket...".to_owned(),
-        Role::Viewer { pid } => format!("Holder {pid}."),
         Role::Holder(Phase::Fetching) => "Fetching from Bitbucket...".to_owned(),
         Role::Holder(Phase::Ready) => String::new(),
         Role::Holder(Phase::Auth) => "Token rejected.".to_owned(),
@@ -805,14 +957,5 @@ fn blank() -> Rect {
         y: 0,
         width: 0,
         height: 0,
-    }
-}
-
-fn full(buffer: &Buffer) -> Rect {
-    Rect {
-        x: 0,
-        y: 0,
-        width: buffer.width(),
-        height: buffer.height(),
     }
 }

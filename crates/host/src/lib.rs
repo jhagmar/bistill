@@ -616,5 +616,35 @@ fn redact(header: &str) -> String {
     }
 }
 
+#[cfg(unix)]
+mod tray_unix;
+#[cfg(windows)]
+mod tray_windows;
+
+/// Show `count` unread pull requests on the tray icon.
+///
+/// Linux uses the StatusNotifierItem protocol on the session bus. Windows uses
+/// `Shell_NotifyIcon`. A missing watcher is an error; the caller logs it once.
+pub(crate) fn tray_tip(count: u64) -> String {
+    if count == 0 {
+        "Nothing new".to_owned()
+    } else if count == 1 {
+        "1 unread".to_owned()
+    } else {
+        format!("{count} unread")
+    }
+}
+
+pub fn set_tray(count: u64) -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        tray_unix::set_unread(count)
+    }
+    #[cfg(windows)]
+    {
+        tray_windows::set_unread(count)
+    }
+}
+
 #[cfg(test)]
 mod tests;
