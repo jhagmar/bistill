@@ -266,7 +266,7 @@ fn read_user(username: &str, value: &json::Value) -> Result<User, Error> {
 fn read_inbox(value: &json::Value) -> Result<InboxCount, Error> {
     match (u64_field(value, "reviewer"), u64_field(value, "author")) {
         (Some(reviewer), Some(author)) => Ok(InboxCount::Split { reviewer, author }),
-        _ => match u64_field(value, "count") {
+        _ => match u64_field(value, "count").or_else(|| u64_field(value, "OPEN")) {
             Some(count) => Ok(InboxCount::Total(count)),
             None => Err(shape("missing inbox count")),
         },

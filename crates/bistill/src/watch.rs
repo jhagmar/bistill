@@ -1,9 +1,7 @@
-//! `bistill watch` polls on the thread that called it.
+//! The lock holder polls on the thread that called it.
 //!
-//! The process that holds the lock writes `snapshot.json`, compares it with
-//! the previous copy, and sends notifications. If `poll.lock` already names a
-//! live process, this one exits 1. When a poll fails, the last rows stay, the
-//! snapshot records why, and the loop waits. The wait starts at
+//! That process writes `snapshot.json`. When a poll fails, the last rows stay,
+//! the snapshot records why, and the loop waits. The wait starts at
 //! `poll_seconds` (at least 15 seconds), doubles, and stops growing at 10
 //! minutes. HTTP 429 uses `Retry-After` when the response includes it. A
 //! `refresh` file is removed within about a second, and the next poll still
@@ -11,11 +9,9 @@
 //!
 //! [`Board`] is what the screen draws while this loop runs.
 
-use crate::lock::{self, Acquire};
-use crate::{Session, explain, send_notices};
+use crate::{Session, explain};
 use bistill_lib::{
-    Client, Config, CurlFault, Error, InboxFault, Snapshot, SnapshotStatus, diff, read_snapshot,
-    write_snapshot,
+    Client, Config, CurlFault, Error, InboxFault, Row, Snapshot, SnapshotStatus, write_snapshot,
 };
 use std::path::Path;
 use std::sync::Mutex;
@@ -83,37 +79,6 @@ impl Board {
     }
 }
 
-pub(crate) fn run(session: &mut dyn Session, config: &Config, verbose: bool) -> Outcome {
-    let previous = match read_snapshot(&config.state_dir) {
-        Ok(previous) => previous,
-        Err(err) => {
-            return Outcome {
-                stderr: explain(&err),
-                code: bistill_lib::exit_code(&err),
-            };
-        }
-    };
-    let held = match lock::acquire(&config.state_dir) {
-        Ok(Acquire::Holder(held)) => held,
-        Ok(Acquire::Busy { pid }) => {
-            return Outcome {
-                stderr: format!("Another bistill is polling (pid {pid}).\n"),
-                code: 1,
-            };
-        }
-        Err(err) => {
-            return Outcome {
-                stderr: explain(&Error::from(err)),
-                code: 1,
-            };
-        }
-    };
-    let board = Mutex::new(Board::new(previous));
-    let outcome = poll(session, config, verbose, &board);
-    drop(held);
-    outcome
-}
-
 pub(crate) fn poll(
     session: &mut dyn Session,
     config: &Config,
@@ -136,7 +101,7 @@ pub(crate) fn poll(
             continue;
         }
         set_phase(board, PollPhase::Fetching);
-        let baseline = board.lock().unwrap().snapshot.clone();
+        let cached = cached_rows(&board.lock().unwrap().snapshot);
         let write_error = Mutex::new(None);
         let mut publish = |snapshot: &Snapshot| match write_snapshot(&config.state_dir, snapshot) {
             Ok(()) => {
@@ -148,7 +113,7 @@ pub(crate) fn poll(
                 Err(err)
             }
         };
-        match session.poll(&client, now, &mut publish) {
+        match session.poll(&client, now, &cached, &mut publish) {
             Ok(listed) => {
                 if verbose {
                     for request in &listed.requests {
@@ -156,15 +121,12 @@ pub(crate) fn poll(
                         stderr.push('\n');
                     }
                 }
-                let mut changes = diff(baseline.as_ref(), &listed.snapshot);
                 {
                     let mut guard = board.lock().unwrap();
                     guard.note.clear();
                     guard.snapshot = Some(listed.snapshot);
                     guard.phase = PollPhase::Ready;
                 }
-                session.clarify(&client, &mut changes);
-                stderr.push_str(&send_notices(session, &changes));
                 last_ms = now;
                 gap = Gap::Steady;
                 next_ms = now.saturating_add(floor);
@@ -208,6 +170,17 @@ pub(crate) fn poll(
         }
     }
     Outcome { stderr, code: 0 }
+}
+
+fn cached_rows(snapshot: &Option<Snapshot>) -> Vec<Row> {
+    match snapshot {
+        Some(snapshot) => {
+            let mut rows = snapshot.needs_review.clone();
+            rows.extend(snapshot.waiting.iter().cloned());
+            rows
+        }
+        None => Vec::new(),
+    }
 }
 
 fn set_phase(board: &Mutex<Board>, phase: PollPhase) {

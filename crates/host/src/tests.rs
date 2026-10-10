@@ -461,3 +461,200 @@ fn toast_and_open_report_spawn_results() {
         Err(Error::Missing { .. })
     ));
 }
+
+struct Pipe {
+    inbound: Vec<u8>,
+    at: usize,
+    fail_write: bool,
+    fail_read: bool,
+    fail_read_after: bool,
+    writes: usize,
+    fail_write_at: Option<usize>,
+}
+
+impl Read for Pipe {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.fail_read {
+            return Err(std::io::Error::other("closed"));
+        }
+        if self.fail_read_after && self.at >= self.inbound.len() {
+            return Err(std::io::Error::other("closed"));
+        }
+        if self.at >= self.inbound.len() {
+            Ok(0)
+        } else {
+            let n = buf.len().min(self.inbound.len() - self.at);
+            buf[..n].copy_from_slice(&self.inbound[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+}
+
+impl Write for Pipe {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fail_write || self.fail_write_at == Some(self.writes) {
+            Err(std::io::Error::other("closed"))
+        } else {
+            self.writes += 1;
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn tray_registers_and_reports_a_missing_watcher() {
+    assert_eq!(tray_tip(0), "Nothing new");
+    assert_eq!(tray_tip(1), "1 unread");
+    assert_eq!(tray_tip(4), "4 unread");
+    let missing = set_tray(0);
+    let _ = missing;
+    assert!(tray_unix::set_unread_at(None, 1, std::path::Path::new("/dev/null")).is_err());
+    assert!(
+        tray_unix::set_unread_at(Some("tcp:host=1"), 1, std::path::Path::new("/dev/null")).is_err()
+    );
+    assert!(
+        tray_unix::set_unread_at(
+            Some("unix:path=/no/such/bistill-bus"),
+            1,
+            std::path::Path::new("/dev/null")
+        )
+        .is_err()
+    );
+    let mut ok = Pipe {
+        inbound: b"OK 1\r\nready\nActivate".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut ok, 2).is_ok());
+    let mut rejected = Pipe {
+        inbound: b"REJECTED\r\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut rejected, 0).is_err());
+    let mut err_reply = Pipe {
+        inbound: b"OK 1\r\nERR no\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut err_reply, 3).is_err());
+    let mut closed = Pipe {
+        inbound: Vec::new(),
+        at: 0,
+        fail_write: true,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut closed, 1).is_err());
+    let mut dead = Pipe {
+        inbound: b"OK 1\r\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: true,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut dead, 1).is_err());
+    let mut late = Pipe {
+        inbound: b"OK 1\r\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: true,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut late, 1).is_err());
+    let mut long = Pipe {
+        inbound: vec![b'A'; 513],
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert!(tray_unix::register(&mut long, 0).is_err());
+    let mut begin = Pipe {
+        inbound: b"OK 1\r\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: Some(1),
+    };
+    assert!(tray_unix::register(&mut begin, 1).is_err());
+    let mut body = Pipe {
+        inbound: b"OK 1\r\n".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: Some(2),
+    };
+    assert!(tray_unix::register(&mut body, 1).is_err());
+    let dir = std::env::temp_dir().join(format!("bistill-tray-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tty = dir.join("tty");
+    std::fs::write(&tty, b"").unwrap();
+    tray_unix::raise_terminal(&tty);
+    assert!(
+        std::fs::read(&tty)
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == b"\x1b[")
+    );
+    tray_unix::raise_terminal(dir.join("missing").as_path());
+    let listener = std::os::unix::net::UnixListener::bind(dir.join("bus")).unwrap();
+    let path = dir.join("bus");
+    let address = format!("unix:path={}", path.display());
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 256];
+        let _ = sock.read(&mut buf);
+        let _ = sock.write_all(b"OK 1\r\n");
+        let _ = sock.read(&mut buf);
+        let _ = sock.write_all(b"ready\n");
+        let _ = sock.write_all(b"Activate");
+    });
+    assert!(tray_unix::set_unread_at(Some(&address), 2, &tty).is_ok());
+    server.join().unwrap();
+    let mut quiet = Pipe {
+        inbound: b"nope".to_vec(),
+        at: 0,
+        fail_write: false,
+        fail_read: false,
+        fail_read_after: false,
+        writes: 0,
+        fail_write_at: None,
+    };
+    assert_eq!(tray_unix::next_member(&mut quiet).as_deref(), Some(""));
+    let tty_path = dir.join("tty");
+    tray_unix::raise_on_activate(Some("nope".to_owned()), &tty_path);
+    tray_unix::raise_on_activate(None, &tty_path);
+    tray_unix::raise_on_activate(Some("Activate".to_owned()), &tty_path);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

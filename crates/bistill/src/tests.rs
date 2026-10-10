@@ -1,5 +1,5 @@
 use super::*;
-use bistill_lib::{Bodies, CurlFault, InboxCount, JsonError, Product, User};
+use bistill_lib::{Bodies, CurlFault, InboxCount, JsonError, Listed, Product, Row, User};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -63,8 +63,6 @@ struct Script {
     report: Option<Result<Report, Error>>,
     listed: Option<Result<Listed, Error>>,
     origin: String,
-    toasts: Vec<host::Toast>,
-    fail_notify: bool,
 }
 
 impl Session for Script {
@@ -78,37 +76,21 @@ impl Session for Script {
         self.report.take().expect("ping")
     }
 
-    fn list(
-        &mut self,
-        client: &Client,
-        now_ms: u64,
-        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        let _ = now_ms;
-        self.origin = client.requests()[0].url.clone();
-        let listed = self.listed.take().expect("list")?;
-        publish(&listed.snapshot)?;
-        Ok(listed)
-    }
-
-    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
-        self.toasts.push(toast.clone());
-        if self.fail_notify {
-            Err(host::Error::Missing {
-                program: super::notify_bin::PROGRAM.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     fn poll(
         &mut self,
         client: &Client,
         now_ms: u64,
+        _cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
-        self.list(client, now_ms, publish)
+        let _ = now_ms;
+        self.origin = client.requests()[0].url.clone();
+        let listed = self.listed.take().expect("list");
+        listed
+            .and_then(|listed| {
+                publish(&listed.snapshot)?;
+                Ok(listed)
+            })
             .map_err(|error| bistill_lib::InboxFault {
                 error,
                 retry_after_ms: None,
@@ -142,8 +124,6 @@ fn ready(report: Result<Report, Error>) -> Script {
         report: Some(report),
         listed: None,
         origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
     }
 }
 
@@ -153,11 +133,10 @@ fn help_lists_ping_options() {
     let (code, stdout, stderr, _) = run(&["--help"], &cwd, &env_token(), ready(Ok(report())));
     assert_eq!(code, 0);
     assert!(stdout.contains("bistill ping"));
-    assert!(stdout.contains("bistill ls"));
+    assert!(stdout.contains("bistill tui"));
     assert!(stdout.contains("--json"));
-    assert!(stdout.contains("--count"));
     assert!(stdout.contains("--verbose"));
-    assert!(stdout.contains("bistill watch"));
+    assert!(!stdout.contains("bistill watch"));
     assert!(!stdout.contains("The Bitbucket list you were missing."));
     assert!(stderr.is_empty());
     let (again, text, _, _) = run(&["-h"], &cwd, &env_token(), ready(Ok(report())));
@@ -181,7 +160,7 @@ fn usage_names_the_next_step() {
     let (code, stdout, stderr, _) = run(&[], &cwd, &env, ready(Ok(report())));
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("Run ping, ls, or watch."));
+    assert!(stderr.contains("Run ping, or start the inbox"));
     assert!(stderr.contains("Usage: bistill ping"));
     let (_, _, unknown, _) = run(&["serve"], &cwd, &env, ready(Ok(report())));
     assert!(unknown.contains("Unknown argument."));
@@ -421,8 +400,6 @@ fn ready_version(err: Result<String, Error>) -> Script {
         report: None,
         listed: None,
         origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
     }
 }
 
@@ -578,17 +555,6 @@ fn ping_through_curl_reads_a_local_server() {
     fs::remove_dir_all(&cwd).unwrap();
 }
 
-fn listed_script(listed: Result<Listed, Error>) -> Script {
-    Script {
-        version: None,
-        report: None,
-        listed: Some(listed),
-        origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
-    }
-}
-
 fn sample_row(
     project: &str,
     repo: &str,
@@ -622,6 +588,8 @@ fn sample_row(
         conflicted: false,
         can_merge: false,
         fingerprint: String::new(),
+        events: Vec::new(),
+        events_loaded: false,
     }
 }
 
@@ -644,64 +612,19 @@ fn sample_snapshot(needs_review: Vec<Row>, waiting: Vec<Row>) -> Snapshot {
 }
 
 #[test]
-fn ls_prints_sections_count_and_json() {
+fn ls_and_watch_are_unknown_commands() {
     let cwd = temp("ls");
     let env = env_token();
-    let snapshot = || {
-        sample_snapshot(
-            vec![
-                sample_row("PRJ", "repo", 13, "Draft the pipe", true, false, false),
-                sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false),
-            ],
-            vec![
-                sample_row("PRJ", "pipe", 21, "Waiting on Sam", false, true, true),
-                sample_row("~jcitizen", "mine", 3, "Personal repo", false, false, false),
-            ],
-        )
-    };
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(code, 0);
-    assert!(stderr.is_empty());
-    assert!(stdout.contains("Needs review\n"));
-    assert!(stdout.contains("Waiting on others\n"));
-    assert!(stdout.contains("PRJ/repo#13  Draft the pipe  draft\n"));
-    assert!(stdout.contains("PRJ/repo#12  Fix the pipe\n"));
-    assert!(stdout.contains("PRJ/pipe#21  Waiting on Sam  stale  needs work\n"));
-    assert!(stdout.contains("~jcitizen/mine#3  Personal repo\n"));
-    let (count_code, count, _, _) = run(
-        &["ls", "--count", "--json"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(count_code, 0);
-    assert_eq!(count, "2\n");
-    let (json_code, json, _, _) = run(
-        &["ls", "--json"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(json_code, 0);
-    assert!(json.contains("\"id\":\"PRJ/repo/13\""));
-    assert!(json.ends_with('\n'));
-    let disk = fs::read_to_string(cwd.join("snapshot.json")).unwrap();
-    assert!(disk.contains("PRJ/repo/13"));
-    assert!(disk.contains("fingerprint"));
+    let (code, stdout, stderr, _) = run(&["ls"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Unknown argument."));
+    let (watch_code, _, watch_err, _) = run(&["watch"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(watch_code, 1);
+    assert!(watch_err.contains("Unknown argument."));
+    let (tui_code, _, tui_err, _) = run(&["tui"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(tui_code, 1);
+    assert!(tui_err.contains("Open a terminal"));
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -715,17 +638,9 @@ fn ls_refuses_a_file_as_state_dir() {
         format!("state_dir = {}\n", file.display()),
     )
     .unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     assert_eq!(code, 1, "{stderr}");
-    assert!(stdout.is_empty());
     assert!(!stderr.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
@@ -743,68 +658,81 @@ fn ls_refuses_a_read_only_state_dir() {
     )
     .unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
-    assert!(stdout.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 
 #[test]
-fn ls_empty_is_success_and_verbose_redacts() {
-    let cwd = temp("ls-empty");
-    let env = env_token();
-    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
+fn tui_request_reads_the_bare_command_and_the_subcommand() {
+    let bare = match tui_request(&args(&[])) {
+        Some(Ok(tui)) => tui,
+        _ => panic!("bare"),
+    };
+    assert!(!bare.verbose);
+    let tui = match tui_request(&args(&[
+        "tui",
+        "--verbose",
+        "--url",
+        "https://git.example.invalid",
+    ])) {
+        Some(Ok(tui)) => tui,
+        _ => panic!("tui"),
+    };
+    assert!(tui.verbose);
+    assert_eq!(
+        tui.flags.base_url.as_deref(),
+        Some("https://git.example.invalid")
+    );
+    let err = match tui_request(&args(&["tui", "--nope"])) {
+        Some(Err(err)) => err,
+        Some(Ok(_)) => panic!("bad flag"),
+        None => panic!("missing"),
+    };
+    assert!(err.contains("Unknown argument."));
+    assert!(tui_request(&args(&["ping"])).is_none());
+    assert!(tui_request(&args(&["tui", "--help"])).is_none());
+}
+
+#[test]
+fn script_poll_publishes_or_returns_the_listed_error() {
+    let cwd = temp("script-poll");
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let request =
-        client.request("/rest/api/1.0/inbox/pull-requests?role=REVIEWER&start=0&limit=25");
-    let (code, stdout, stderr, _) = run(
-        &["ls", "--verbose"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: vec![request],
-        })),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "Nothing needs your attention.\n");
-    assert!(stderr.contains("Bearer ***"));
-    assert!(!stderr.contains("secret-token"));
-    let (missing, _, err, _) = run(
-        &["ls"],
-        &cwd,
-        &Env::new(),
-        listed_script(Ok(Listed {
+    let mut script = Script {
+        version: None,
+        report: None,
+        listed: Some(Ok(Listed {
             snapshot: sample_snapshot(Vec::new(), Vec::new()),
             requests: Vec::new(),
         })),
-    );
-    assert_eq!(missing, 1);
-    assert!(err.contains("base_url"));
-    let (rejected, out, token, _) = run(&["ls"], &cwd, &env, listed_script(Err(Error::Http(401))));
-    assert_eq!(rejected, 11);
-    assert!(out.is_empty());
-    assert!(token.contains("Token rejected."));
-    let (url_code, _, _, origin) = run(
-        &["ls", "--url", "https://ls.example.invalid"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(url_code, 0);
-    assert!(origin.starts_with("https://ls.example.invalid"));
+        origin: String::new(),
+    };
+    let mut published = false;
+    match script.poll(&client, 0, &[], &mut |_| {
+        published = true;
+        Ok(())
+    }) {
+        Ok(_) => assert!(published),
+        Err(_) => panic!("publish"),
+    }
+    script.listed = Some(Err(Error::Http(401)));
+    match script.poll(&client, 0, &[], &mut |_| Ok(())) {
+        Err(err) => assert!(matches!(err.error, Error::Http(401))),
+        Ok(_) => panic!("http"),
+    }
+    script.listed = Some(Ok(Listed {
+        snapshot: sample_snapshot(Vec::new(), Vec::new()),
+        requests: Vec::new(),
+    }));
+    match script.poll(&client, 0, &[], &mut |_| {
+        Err(Error::Io(std::io::Error::other("disk")))
+    }) {
+        Err(err) => assert!(matches!(err.error, Error::Io(_))),
+        Ok(_) => panic!("io"),
+    }
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -847,8 +775,8 @@ fn live_list_reads_http_status() {
     env.base_url = Some(format!("http://127.0.0.1:{port}"));
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let err = match Live.list(&client, 0, &mut |_| Ok(())) {
-        Err(err) => err,
+    let err = match Live.poll(&client, 0, &[], &mut |_| Ok(())) {
+        Err(err) => err.error,
         Ok(_) => panic!("expected HTTP 500"),
     };
     assert!(matches!(err, Error::Http(500)), "{err}");
@@ -857,193 +785,13 @@ fn live_list_reads_http_status() {
 }
 
 #[test]
-fn ls_notifies_each_change_and_logs_a_missing_notifier_once() {
-    let cwd = temp("notify");
-    let env = env_token();
-    let rows = || {
-        sample_snapshot(
-            vec![sample_row(
-                "PRJ",
-                "repo",
-                12,
-                "Fix the pipe",
-                false,
-                false,
-                false,
-            )],
-            vec![sample_row(
-                "PRJ",
-                "pipe",
-                21,
-                "Waiting on Sam",
-                false,
-                true,
-                true,
-            )],
-        )
-    };
-    let mut script = listed_script(Ok(Listed {
-        snapshot: rows(),
-        requests: Vec::new(),
-    }));
-    script.fail_notify = true;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut script,
-    );
-    let err = String::from_utf8(stderr).unwrap();
-    let out = String::from_utf8(stdout).unwrap();
-    assert_eq!(code, 0, "{err}");
-    assert!(out.contains("Needs review"));
-    assert_eq!(script.toasts.len(), 2);
-    let program = super::notify_bin::PROGRAM;
-    assert_eq!(
-        err.matches(&format!("{program} must be on PATH.")).count(),
-        1
-    );
-    assert_toast(
-        &script.toasts[0],
-        "PRJ/repo#12 needs review\nhttps://git.example.invalid/pull/12",
-    );
-    assert_toast(
-        &script.toasts[1],
-        "PRJ/pipe#21 waiting\nhttps://git.example.invalid/pull/21",
-    );
-
-    let mut quiet = listed_script(Ok(Listed {
-        snapshot: rows(),
-        requests: Vec::new(),
-    }));
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut quiet,
-    );
-    assert_eq!(code, 0);
-    assert!(quiet.toasts.is_empty());
-    assert!(String::from_utf8(stderr).unwrap().is_empty());
-
-    let mut gone = listed_script(Ok(Listed {
-        snapshot: sample_snapshot(
-            vec![sample_row(
-                "PRJ",
-                "repo",
-                12,
-                "Fix the pipe",
-                false,
-                false,
-                false,
-            )],
-            Vec::new(),
-        ),
-        requests: Vec::new(),
-    }));
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut gone,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(gone.toasts.len(), 1);
-    assert_toast(
-        &gone.toasts[0],
-        "PRJ/pipe#21 merged or declined\nhttps://git.example.invalid/pull/21",
-    );
-    fs::remove_dir_all(&cwd).unwrap();
-}
-
-fn assert_toast(toast: &host::Toast, body: &str) {
-    let args = host::toast_arguments(toast);
-    let text = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(text.contains(body), "{text}");
-    #[cfg(unix)]
-    {
-        match toast {
-            host::Toast::NotifySend {
-                program,
-                title,
-                expire,
-                ..
-            } => {
-                assert_eq!(program, "notify-send");
-                assert_eq!(title, "Bistill");
-                assert_eq!(*expire, Some(Duration::from_millis(10_000)));
-            }
-            host::Toast::PowerShell { .. } => panic!("linux toast is notify-send"),
-        }
-        assert!(text.contains("--expire-time"));
-        assert!(text.contains("10000"));
-    }
-    #[cfg(windows)]
-    {
-        match toast {
-            host::Toast::PowerShell {
-                program,
-                title,
-                url,
-                ..
-            } => {
-                assert_eq!(program, "powershell.exe");
-                assert_eq!(title, "Bistill");
-                assert_eq!(url.as_deref(), Some(body.lines().nth(1).unwrap()));
-            }
-            host::Toast::NotifySend { .. } => panic!("windows toast is powershell"),
-        }
-    }
-}
-
-#[test]
 fn ls_refuses_a_corrupt_snapshot() {
     let cwd = temp("corrupt-snapshot");
     fs::write(cwd.join("snapshot.json"), "{").unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     assert_eq!(code, 5, "{stderr}");
-    assert!(stdout.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
-}
-
-#[test]
-fn live_notify_reports_a_missing_program() {
-    let toast = host::Toast::NotifySend {
-        program: "bistill-missing-notify".to_owned(),
-        title: "Bistill".to_owned(),
-        body: "body".to_owned(),
-        expire: None,
-        timeout: Duration::from_secs(1),
-    };
-    let err = Live.notify(&toast).unwrap_err();
-    assert!(matches!(
-        err,
-        host::Error::Missing { program } if program == "bistill-missing-notify"
-    ));
 }
 
 const SCREEN_NOW: u64 = 1_700_000_000_000;
@@ -1255,7 +1003,7 @@ fn screen_draws_both_layouts_and_status_lines() {
         &ready,
         0,
     );
-    assert!(row_text(&ready_grid, 23).trim().is_empty());
+    assert!(row_text(&ready_grid, 23).contains("j/k move"));
 
     let auth = screen::Role::Holder(screen::Phase::Auth);
     let auth_grid = draw_screen(
@@ -1303,17 +1051,7 @@ fn screen_draws_both_layouts_and_status_lines() {
     );
     assert!(row_text(&limited_grid, 23).contains("Rate limited."));
 
-    let viewer = screen::Role::Viewer { pid: 42 };
-    let viewer_grid = draw_screen(
-        &mut screen::Screen::new(),
-        160,
-        24,
-        Some(&snapshot),
-        &viewer,
-        0,
-    );
-    assert!(row_text(&viewer_grid, 23).contains("Holder 42."));
-    let loading = draw_screen(&mut screen::Screen::new(), 160, 24, None, &viewer, 0);
+    let loading = draw_screen(&mut screen::Screen::new(), 160, 24, None, &holder, 0);
     let loading_text = grid_text(&loading);
     assert!(row_text(&loading, 23).contains("Fetching from Bitbucket..."));
     assert!(loading_text.contains("0/0"));
@@ -2048,8 +1786,7 @@ struct Poller {
     refresh: bool,
     readonly_on: Option<u32>,
     state: PathBuf,
-    toasts: Vec<host::Toast>,
-    fail_notify: bool,
+    cached: Vec<usize>,
 }
 
 impl Session for Poller {
@@ -2061,32 +1798,14 @@ impl Session for Poller {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(
-        &mut self,
-        _: &Client,
-        _: u64,
-        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        Err(Error::Auth("unused".to_owned()))
-    }
-
-    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
-        self.toasts.push(toast.clone());
-        if self.fail_notify {
-            Err(host::Error::Missing {
-                program: notify_bin::PROGRAM.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     fn poll(
         &mut self,
         _: &Client,
         _: u64,
+        cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
+        self.cached.push(cached.len());
         self.polls += 1;
         if self.readonly_on == Some(self.polls) {
             self.readonly_on = None;
@@ -2149,8 +1868,7 @@ fn poller(cwd: &Path, steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Po
         refresh: false,
         readonly_on: None,
         state: cwd.to_owned(),
-        toasts: Vec::new(),
-        fail_notify: false,
+        cached: Vec::new(),
     }
 }
 
@@ -2176,18 +1894,23 @@ fn fault(status: u16, retry_after_ms: Option<u64>) -> Result<Listed, bistill_lib
     })
 }
 
-fn run_watch(cwd: &Path, poller: &mut Poller) -> (i32, String) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch", "--verbose"]),
-        cwd,
-        &env_token(),
-        &mut stdout,
-        &mut stderr,
-        poller,
-    );
-    (code, String::from_utf8(stderr).unwrap())
+fn run_watch(cwd: &Path, poller: &mut Poller, verbose: bool) -> (i32, String) {
+    let config = bistill_lib::load(cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
+    let previous = match bistill_lib::read_snapshot(&config.state_dir) {
+        Ok(previous) => previous,
+        Err(err) => return (bistill_lib::exit_code(&err), explain(&err)),
+    };
+    let held = match lock::acquire(&config.state_dir) {
+        Ok(lock::Acquire::Holder(held)) => held,
+        Ok(lock::Acquire::Busy { pid }) => {
+            return (1, format!("Another bistill is polling (pid {pid}).\n"));
+        }
+        Err(err) => return (1, explain(&Error::from(err))),
+    };
+    let board = std::sync::Mutex::new(watch::Board::new(previous));
+    let outcome = watch::poll(poller, &config, verbose, &board);
+    drop(held);
+    (outcome.code, outcome.stderr)
 }
 
 #[test]
@@ -2198,14 +1921,12 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         &cwd,
         vec![listed_ok(vec![again()]), listed_ok(vec![again()])],
     );
-    session.fail_notify = true;
     session.stop_after_polls = 2;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("Bearer ***"));
     assert!(!stderr.contains("secret-token"));
-    assert_eq!(session.toasts.len(), 1);
-    assert!(stderr.contains("must be on PATH."));
+    assert_eq!(session.cached, vec![0, 1]);
     assert_eq!(session.pauses, vec![1_000]);
     assert!(!cwd.join("poll.lock").exists());
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
@@ -2218,7 +1939,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         vec![listed_ok(vec![row]), fault(401, None), fault(401, None)],
     );
     session.stop_after_polls = 3;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("Token rejected."));
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
@@ -2232,7 +1953,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         vec![fault(500, None), fault(500, None), fault(500, None)],
     );
     session.stop_after_polls = 3;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
     assert_eq!(session.pauses, vec![1_000, 1_000, 1_000]);
     assert!(!cwd.join("snapshot.json").exists());
@@ -2242,7 +1963,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.stop_after_polls = 2;
     session.jump = 200_000;
     session.refresh = true;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(session.pauses, vec![1_000]);
     assert!(!cwd.join("refresh").exists());
@@ -2254,7 +1975,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.stop_after_polls = 2;
     session.stop_after_pauses = Some(1);
     session.refresh = true;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
     assert!(session.polls == 1);
 
@@ -2269,7 +1990,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     );
     session.stop_after_polls = 3;
     session.jump = 650_000;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
     assert_eq!(session.pauses.len(), 2);
 
@@ -2283,7 +2004,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
             retry_after_ms: None,
         })],
     );
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("curl must be on PATH."));
     assert!(!cwd.join("poll.lock").exists());
@@ -2308,7 +2029,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     let cwd = watch_dir("watch-busy");
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains(&format!("pid {}).", std::process::id())));
     assert!(cwd.join("poll.lock").exists());
@@ -2322,7 +2043,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     assert!(!super::pid_os::pid_alive(0));
     fs::write(cwd.join("poll.lock"), format!("{pid}\n")).unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(!cwd.join("poll.lock").exists());
 
@@ -2363,7 +2084,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     let cwd = watch_dir("watch-corrupt");
     fs::write(cwd.join("snapshot.json"), "{").unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 5, "{stderr}");
     assert!(!cwd.join("poll.lock").exists());
 
@@ -2377,7 +2098,7 @@ fn watch_returns_when_the_snapshot_cannot_be_written() {
     let cwd = watch_dir("watch-write-ok");
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
     session.readonly_on = Some(1);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
 
@@ -2385,7 +2106,7 @@ fn watch_returns_when_the_snapshot_cannot_be_written() {
     let mut session = poller(&cwd, vec![listed_ok(Vec::new()), fault(401, None)]);
     session.stop_after_polls = 2;
     session.readonly_on = Some(2);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
     fs::remove_dir_all(&cwd).unwrap();
@@ -2443,56 +2164,10 @@ fn watch_status_follows_the_failure() {
         ],
     );
     session.stop_after_polls = 2;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Tls);
-    fs::remove_dir_all(&cwd).unwrap();
-}
-
-#[test]
-fn live_clarify_reads_a_merged_pull_request() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    listener.set_nonblocking(true).expect("nonblocking");
-    let thread = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut sock, _)) => {
-                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf);
-                    let body = br#"{"state":"MERGED"}"#;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes());
-                    let _ = sock.write_all(body);
-                    break;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    let cwd = temp("live-gone");
-    let mut env = env_token();
-    env.base_url = Some(format!("http://127.0.0.1:{port}"));
-    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
-    let client = Client::new(curl_bin::PROGRAM, &config);
-    let mut changes = vec![bistill_lib::Change {
-        id: "PRJ/repo/12".to_owned(),
-        html_url: "https://git.example.invalid/pull/12".to_owned(),
-        reasons: vec![bistill_lib::Reason::Gone],
-        gone_text: String::new(),
-    }];
-    Live.clarify(&client, &mut changes);
-    thread.join().expect("server");
-    assert_eq!(changes[0].gone_text, "merged");
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -2501,7 +2176,7 @@ fn live_poll_reports_a_missing_program() {
     let cwd = watch_dir("live-poll");
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
     let client = Client::new("bistill-missing-poll", &config);
-    let err = match Live.poll(&client, 1, &mut |_| Ok(())) {
+    let err = match Live.poll(&client, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("missing"),
     };
@@ -2517,41 +2192,18 @@ fn live_poll_reports_a_missing_program() {
 
 #[test]
 fn watch_reports_config_and_lock_errors() {
-    let cwd = watch_dir("watch-config");
-    let mut session = poller(&cwd, Vec::new());
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch"]),
-        &cwd,
-        &Env::new(),
-        &mut stdout,
-        &mut stderr,
-        &mut session,
-    );
-    assert_eq!(code, 1);
-    fs::remove_dir_all(&cwd).unwrap();
-
     let cwd = watch_dir("watch-lock-err");
     fs::create_dir(cwd.join("poll.lock")).unwrap();
     let mut session = poller(&cwd, Vec::new());
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 1, "{stderr}");
     fs::remove_dir_all(&cwd).unwrap();
 
     let cwd = watch_dir("watch-quiet");
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch"]),
-        &cwd,
-        &env_token(),
-        &mut stdout,
-        &mut stderr,
-        &mut session,
-    );
-    assert_eq!(code, 0, "{}", String::from_utf8(stderr).unwrap());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -2575,23 +2227,11 @@ impl Session for Inbox {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(
-        &mut self,
-        _: &Client,
-        _: u64,
-        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        Err(Error::Auth("unused".to_owned()))
-    }
-
-    fn notify(&mut self, _: &host::Toast) -> Result<(), host::Error> {
-        Ok(())
-    }
-
     fn poll(
         &mut self,
         _: &Client,
         _: u64,
+        _cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
         self.polls += 1;
@@ -2643,7 +2283,6 @@ fn feed(steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Inbox {
 
 enum DriveStep {
     Until(String),
-    Run(Box<dyn FnMut()>),
     Event(tui::Event),
 }
 
@@ -2700,11 +2339,6 @@ impl tui::Backend for Drive {
                     assert!(self.spins < 10_000, "stalled\n{text}");
                     std::thread::yield_now();
                     return None;
-                }
-                Some(DriveStep::Run(_)) => {
-                    if let Some(DriveStep::Run(mut run)) = self.queue.pop_front() {
-                        run();
-                    }
                 }
                 Some(DriveStep::Event(_)) => {
                     if let Some(DriveStep::Event(event)) = self.queue.pop_front() {
@@ -2766,7 +2400,8 @@ fn tui_holder_opens_refreshes_and_releases_the_lock() {
     ]);
     backend.barrier = Some(barrier);
     let mut opened = Vec::new();
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |url| {
         opened.push(url.to_owned());
         if opened.len() == 1 {
@@ -2794,6 +2429,161 @@ fn tui_holder_opens_refreshes_and_releases_the_lock() {
 }
 
 #[test]
+fn tui_marks_read_and_ignores_from_the_keys() {
+    let cwd = watch_dir("tui-mark");
+    fs::write(
+        cwd.join("watermarks.json"),
+        r#"{"items":[{"id":"PRJ/repo/12","activity_id":1,"ignored":true,"primed":true,"seen_failed":false,"seen_conflict":false}]}"#,
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('i'),
+        step_key('i'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    let marks = fs::read_to_string(cwd.join("watermarks.json")).unwrap();
+    assert!(marks.contains("PRJ/repo/12"));
+    assert!(marks.contains("\"ignored\":true"));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn tui_logs_a_watermark_that_cannot_be_read() {
+    let cwd = watch_dir("tui-mark-dir");
+    fs::create_dir(cwd.join("watermarks.json")).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert!(!exit.stderr.is_empty());
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_logs_a_watermark_that_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = watch_dir("tui-mark-ro");
+    let log = cwd.join("logs");
+    fs::create_dir(&log).unwrap();
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!(
+            "state_dir = {}\npoll_seconds = 15\nlog_file = {}\n",
+            cwd.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::write(cwd.join("watermarks.json"), b"{\"items\":[]}").unwrap();
+    fs::set_permissions(
+        cwd.join("watermarks.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    fs::set_permissions(
+        cwd.join("watermarks.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn tray_errors_are_logged_once() {
+    let mut log = String::new();
+    let mut logged = false;
+    fn ok(_: u64) -> Result<(), host::Error> {
+        Ok(())
+    }
+    crate::app::record_tray(1, &mut log, &mut logged, ok);
+    assert!(log.is_empty());
+    fn fail(_: u64) -> Result<(), host::Error> {
+        Err(host::Error::Failed {
+            program: "tray".to_owned(),
+            message: "no watcher".to_owned(),
+        })
+    }
+    crate::app::record_tray(1, &mut log, &mut logged, fail);
+    assert!(log.contains("no watcher"));
+    let len = log.len();
+    crate::app::record_tray(2, &mut log, &mut logged, fail);
+    assert_eq!(log.len(), len);
+    let snapshot = sample_snapshot(
+        vec![sample_row(
+            "PRJ",
+            "repo",
+            12,
+            "Fix the pipe",
+            false,
+            false,
+            false,
+        )],
+        Vec::new(),
+    );
+    let mut store = bistill_lib::Store::default();
+    crate::app::apply_ignore(&mut store, &snapshot, "missing");
+    crate::app::apply_ignore(&mut store, &snapshot, "PRJ/repo/12");
+    assert!(bistill_lib::is_ignored(&store, "PRJ/repo/12"));
+}
+
+#[test]
 fn tui_shows_token_rejected_and_a_failed_poll() {
     let cwd = watch_dir("tui-auth");
     let log = cwd.join("bistill.log");
@@ -2816,7 +2606,8 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
         step_key('q'),
     ]);
     backend.barrier = Some(barrier);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(drive_text(&backend.grid).contains("Fix the pipe"));
@@ -2834,7 +2625,8 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
     session.barrier = Some(barrier.clone());
     let mut backend = Drive::new(vec![DriveStep::Until("HTTP 500".to_owned()), step_key('q')]);
     backend.barrier = Some(barrier);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(drive_text(&backend.grid).contains("HTTP 500"));
@@ -2845,38 +2637,16 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
 }
 
 #[test]
-fn tui_viewer_rereads_and_leaves_the_holder() {
+fn tui_second_process_names_the_lock_pid() {
     let cwd = watch_dir("tui-viewer");
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
-    let first = cwd.clone();
-    let second = cwd.clone();
-    let garbage = cwd.clone();
-    let mut backend = Drive::new(vec![
-        DriveStep::Until("Fetching from Bitbucket...".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            let row = sample_row("PRJ", "repo", 12, "First pipe", false, false, false);
-            bistill_lib::write_snapshot(&first, &sample_snapshot(vec![row], Vec::new())).unwrap();
-        })),
-        DriveStep::Until("First pipe".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            let row = sample_row("PRJ", "repo", 13, "Second pipe", false, false, false);
-            bistill_lib::write_snapshot(&second, &sample_snapshot(vec![row], Vec::new())).unwrap();
-        })),
-        DriveStep::Until("Second pipe".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            fs::write(garbage.join("snapshot.json"), b"{").unwrap();
-        })),
-        step_key('r'),
-        step_key('q'),
-    ]);
+    let mut backend = Drive::new(Vec::new());
     let mut session = feed(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
-    assert_eq!(exit.code, 0, "{}", exit.stderr);
-    let text = drive_text(&backend.grid);
-    assert!(text.contains("Second pipe"));
-    assert!(text.contains(&format!("Holder {}.", std::process::id())));
-    assert!(cwd.join("refresh").is_file());
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    assert!(exit.stderr.contains(&std::process::id().to_string()));
     assert_eq!(
         fs::read_to_string(cwd.join("poll.lock")).unwrap().trim(),
         std::process::id().to_string()
@@ -2902,7 +2672,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
         DriveStep::Until("Fix the pipe".to_owned()),
         step_key('q'),
     ]);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(!cwd.join("poll.lock").exists());
@@ -2915,7 +2686,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
         retry_after_ms: None,
     })]);
     let mut backend = Drive::new(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 2, "{}", exit.stderr);
     assert!(exit.stderr.contains("curl must be on PATH."));
@@ -2934,7 +2706,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
     let mut backend = Drive::new(vec![step_key('q')]);
     let mut session = feed(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 1, "{}", exit.stderr);
     fs::remove_dir_all(&cwd).unwrap();
@@ -2949,7 +2722,7 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
 #[test]
 fn tui_prepare_and_phases() {
     let cwd = watch_dir("tui-config");
-    let err = match prepare(&cwd, &Env::new()) {
+    let err = match prepare(&cwd, &bistill_lib::Flags::default(), &Env::new(), false) {
         Err(err) => err,
         Ok(_) => panic!("config"),
     };
@@ -2957,7 +2730,7 @@ fn tui_prepare_and_phases() {
     assert!(!err.stderr.is_empty());
 
     fs::write(cwd.join("snapshot.json"), b"{").unwrap();
-    let err = match prepare(&cwd, &env_token()) {
+    let err = match prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false) {
         Err(err) => err,
         Ok(_) => panic!("json"),
     };
@@ -2965,7 +2738,8 @@ fn tui_prepare_and_phases() {
 
     fs::remove_file(cwd.join("snapshot.json")).unwrap();
     fs::create_dir(cwd.join("poll.lock")).unwrap();
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let mut backend = tui::TestBackend::new(40, 8);
     let mut session = feed(Vec::new());
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
@@ -3027,4 +2801,170 @@ fn tui_prepare_and_phases() {
     }
     let offset = super::zone_os::local_offset_secs();
     assert!(offset.unsigned_abs() <= 24 * 60 * 60);
+}
+
+#[test]
+fn help_box_covers_the_inbox_and_keys_mark_or_ignore() {
+    let mut row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    row.events = vec![
+        bistill_lib::Event {
+            id: 5,
+            created_ms: 1,
+            actor_slug: "ada".to_owned(),
+            actor_name: "Ada".to_owned(),
+            kind: bistill_lib::EventKind::Commented,
+            text: "please look".to_owned(),
+            thread: vec!["ada".to_owned()],
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 4,
+            created_ms: 1,
+            actor_slug: "jcitizen".to_owned(),
+            actor_name: "Jane".to_owned(),
+            kind: bistill_lib::EventKind::Pushed,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 3,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Approved,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 2,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Reopened,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 1,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Added,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: true,
+        },
+        bistill_lib::Event {
+            id: 0,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Other,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+    ];
+    let snapshot = sample_snapshot(vec![row], Vec::new());
+    let mut screen = screen::Screen::new();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert("PRJ/repo/12".to_owned(), 4);
+    screen.set_marks(floors, std::collections::BTreeSet::new());
+    let grid = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    let text = grid_text(&grid);
+    assert!(text.contains("new "));
+    assert!(text.contains("please look"));
+    assert!(text.contains("pushed"));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('m')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(matches!(
+        screen.take_pending(),
+        Some(screen::Pending::Read(id)) if id == "PRJ/repo/12"
+    ));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('i')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(matches!(
+        screen.take_pending(),
+        Some(screen::Pending::Ignore(id)) if id == "PRJ/repo/12"
+    ));
+    let mut ignored = std::collections::BTreeSet::new();
+    ignored.insert("PRJ/repo/12".to_owned());
+    screen.set_marks(std::collections::BTreeMap::new(), ignored);
+    let badged = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    assert!(grid_text(&badged).contains("ignored"));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('?')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    let help = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    let help_text = grid_text(&help);
+    assert!(help_text.contains("Mark this pull request"));
+    assert!(help_text.contains("Fix the pipe"));
+    assert!(row_text(&help, 23).contains("close"));
+    assert_eq!(
+        act(&mut screen, key(tui::KeyCode::Tab), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('m')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('i')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(screen.take_pending().is_none());
 }

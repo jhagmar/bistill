@@ -43,6 +43,8 @@ pub(crate) struct Filled {
     pub conflicted: bool,
     /// Merge `canMerge`.
     pub can_merge: bool,
+    /// Activities from every page of this fetch.
+    pub events: Vec<crate::inbox::Event>,
 }
 
 /// Oldest `updated_ms` first. Needs review precedes Waiting on a tie.
@@ -92,6 +94,8 @@ pub(crate) struct Query<'a> {
     pub user_slug: &'a str,
     /// `fromRef.latestCommit` when the page has one.
     pub from_commit: Option<&'a str>,
+    /// Needs review fetches activities only. Waiting also fetches build and merge.
+    pub activities_only: bool,
 }
 
 /// Sequential GETs. `get` receives the path under `base_url`.
@@ -107,8 +111,19 @@ pub(crate) fn fetch(
         encode_segment(query.repo),
         query.number,
     );
-    let (unanswered_as_author, unanswered_as_reviewer) =
+    let (unanswered_as_author, unanswered_as_reviewer, events) =
         activity_counts(get, &base, query.author_slug, query.user_slug, on)?;
+    if query.activities_only {
+        return Ok(Filled {
+            unanswered_as_author,
+            unanswered_as_reviewer,
+            open_tasks: 0,
+            build: Build::None,
+            conflicted: false,
+            can_merge: false,
+            events,
+        });
+    }
     let open_tasks = open_tasks(get, &base, on)?;
     let build = match query.from_commit {
         None => Build::None,
@@ -130,6 +145,7 @@ pub(crate) fn fetch(
         build,
         conflicted,
         can_merge,
+        events,
     })
 }
 
@@ -140,6 +156,8 @@ pub(crate) fn write(row: &mut Row, filled: Filled) {
     row.build = filled.build;
     row.conflicted = filled.conflicted;
     row.can_merge = filled.can_merge;
+    row.events = filled.events;
+    row.events_loaded = true;
 }
 
 fn activity_counts(
@@ -148,16 +166,19 @@ fn activity_counts(
     author_slug: &str,
     user_slug: &str,
     on: &mut dyn FnMut(Progress) -> Result<(), InboxFault>,
-) -> Result<(u64, u64), InboxFault> {
+) -> Result<(u64, u64, Vec<crate::inbox::Event>), InboxFault> {
     let mut start = 0u64;
     let mut author_n = 0u64;
     let mut reviewer_n = 0u64;
+    let mut events = Vec::new();
     loop {
         let path = format!("{base}/activities?start={start}&limit=25");
         let response = require_ok(get, &path)?;
         let value = parse_body(&response.body)?;
         let (page_author, page_reviewer) =
             count_activities(&value, author_slug, user_slug).map_err(InboxFault::from)?;
+        let mut page = crate::activity::page_events(&value, user_slug).map_err(InboxFault::from)?;
+        events.append(&mut page);
         author_n += page_author;
         reviewer_n += page_reviewer;
         on(Progress::Activities {
@@ -174,7 +195,13 @@ fn activity_counts(
             }
         }
     }
-    Ok((author_n, reviewer_n))
+    events.sort_by(|left, right| {
+        right
+            .id
+            .cmp(&left.id)
+            .then(right.created_ms.cmp(&left.created_ms))
+    });
+    Ok((author_n, reviewer_n, events))
 }
 
 fn open_tasks(

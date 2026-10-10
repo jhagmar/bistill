@@ -161,6 +161,22 @@ pub fn inner(area: Rect) -> Rect {
     }
 }
 
+/// Paint every cell in `area` with a space. The help box uses this so the inbox
+/// underneath does not show through.
+pub fn fill_rect(buffer: &mut Buffer, area: Rect, style: Style) {
+    let mut y = area.y;
+    let bottom = area.y.saturating_add(area.height);
+    while y < bottom {
+        let mut x = area.x;
+        let right = area.x.saturating_add(area.width);
+        while x < right {
+            put(buffer, x, y, " ", style);
+            x = x.saturating_add(1);
+        }
+        y = y.saturating_add(1);
+    }
+}
+
 /// Draw a border and `title` on the top edge.
 pub fn draw_block(
     buffer: &mut Buffer,
@@ -175,17 +191,17 @@ pub fn draw_block(
         let right = area.x.saturating_add(area.width - 1);
         let bottom = area.y.saturating_add(area.height - 1);
         let left = area.x.saturating_add(1);
-        put(buffer, area.x, area.y, "+", style);
-        put(buffer, right, area.y, "+", style);
-        put(buffer, area.x, bottom, "+", style);
-        put(buffer, right, bottom, "+", style);
+        put(buffer, area.x, area.y, "╭", style);
+        put(buffer, right, area.y, "╮", style);
+        put(buffer, area.x, bottom, "╰", style);
+        put(buffer, right, bottom, "╯", style);
         let span = area.width - 2;
         fill(buffer, left, area.y, span, style);
         fill(buffer, left, bottom, span, style);
         let mut y = area.y.saturating_add(1);
         while y < bottom {
-            put(buffer, area.x, y, "|", style);
-            put(buffer, right, y, "|", style);
+            put(buffer, area.x, y, "│", style);
+            put(buffer, right, y, "│", style);
             y = y.saturating_add(1);
         }
         let title = truncate(title, usize::from(span));
@@ -446,7 +462,7 @@ fn put(buffer: &mut Buffer, x: u16, y: u16, text: &str, style: Style) {
 fn fill(buffer: &mut Buffer, x: u16, y: u16, width: u16, style: Style) {
     let mut column = x;
     for _ in 0..width {
-        put(buffer, column, y, "-", style);
+        put(buffer, column, y, "─", style);
         column = column.saturating_add(1);
     }
 }
