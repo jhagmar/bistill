@@ -4,20 +4,30 @@
 //! the snapshot records why, and the loop waits. The wait starts at
 //! `poll_seconds` (at least 15 seconds), doubles, and stops growing at 10
 //! minutes. HTTP 429 uses `Retry-After` when the response includes it. A
-//! `refresh` file is removed within about a second, and the next poll still
+//! `refresh` file wakes the wait, and the next poll still
 //! waits until `poll_seconds` after the previous one.
 //!
 //! [`Board`] is what the screen draws while this loop runs.
 
-use crate::{Session, explain};
+use crate::{Nudge, Paused, Session, explain};
 use bistill_lib::{
     Client, Config, CurlFault, Error, InboxFault, Row, Snapshot, SnapshotStatus, write_snapshot,
 };
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
 const CAP_MS: u64 = 10 * 60 * 1000;
+
+/// Why the screen should paint.
+pub(crate) enum Wake {
+    /// A key, click, or resize.
+    Input(tui::Event),
+    /// The poller published a new phase or snapshot.
+    Republish,
+    /// The poller stopped with a failure.
+    Stop,
+}
 
 enum Gap {
     First,
@@ -84,6 +94,8 @@ pub(crate) fn poll(
     config: &Config,
     verbose: bool,
     board: &Mutex<Board>,
+    nudge: &mpsc::Receiver<Nudge>,
+    paint: &mpsc::Sender<Wake>,
 ) -> Outcome {
     let mut stderr = String::new();
     let mut gap = Gap::First;
@@ -94,18 +106,28 @@ pub(crate) fn poll(
     loop {
         let now = session.now_ms();
         if now < next_ms {
-            match wait(session, board, &config.state_dir, next_ms, last_ms, floor) {
+            match wait(
+                session,
+                board,
+                &config.state_dir,
+                next_ms,
+                last_ms,
+                floor,
+                nudge,
+            ) {
                 Wait::Ready(next) => next_ms = next,
                 Wait::Stop => break,
             }
             continue;
         }
         set_phase(board, PollPhase::Fetching);
+        let _ = paint.send(Wake::Republish);
         let cached = cached_rows(&board.lock().unwrap().snapshot);
         let write_error = Mutex::new(None);
         let mut publish = |snapshot: &Snapshot| match write_snapshot(&config.state_dir, snapshot) {
             Ok(()) => {
                 board.lock().unwrap().snapshot = Some(snapshot.clone());
+                let _ = paint.send(Wake::Republish);
                 Ok(())
             }
             Err(err) => {
@@ -127,6 +149,7 @@ pub(crate) fn poll(
                     guard.snapshot = Some(listed.snapshot);
                     guard.phase = PollPhase::Ready;
                 }
+                let _ = paint.send(Wake::Republish);
                 last_ms = now;
                 gap = Gap::Steady;
                 next_ms = now.saturating_add(floor);
@@ -160,6 +183,7 @@ pub(crate) fn poll(
                         next_attempt_ms: now.saturating_add(delay),
                     };
                 }
+                let _ = paint.send(Wake::Republish);
                 stderr.push_str(&note);
                 last_ms = now;
                 next_ms = now.saturating_add(delay);
@@ -242,6 +266,7 @@ fn wait(
     mut target: u64,
     last_ms: u64,
     floor: u64,
+    nudge: &mpsc::Receiver<Nudge>,
 ) -> Wait {
     loop {
         if stopped(board) || !session.again() {
@@ -251,12 +276,15 @@ fn wait(
         if now >= target {
             return Wait::Ready(target);
         }
-        let slice = (target - now).min(1_000);
-        session.pause(Duration::from_millis(slice));
-        if consume_refresh(state_dir) {
-            let earliest = last_ms.saturating_add(floor);
-            if earliest < target {
-                target = earliest;
+        let gap = Duration::from_millis(target - now);
+        match session.pause(gap, nudge) {
+            Paused::Elapsed => {}
+            Paused::Quit => return Wait::Stop,
+            Paused::Refresh => {
+                let earliest = last_ms.saturating_add(floor);
+                if consume_refresh(state_dir) && earliest < target {
+                    target = earliest;
+                }
             }
         }
     }

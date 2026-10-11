@@ -4,11 +4,17 @@
 //! [`crate::screen`]. A live lock means another bistill is already running,
 //! and this call returns exit 1 with that pid. `q` returns. The caller then
 //! drops the terminal, which puts the previous screen back.
+//!
+//! An input thread blocks in `poll` on the terminal without the draw lock,
+//! then wakes the draw loop with the event. The poller sends a publish on
+//! that same channel. The draw loop paints, then waits until the next event
+//! or the next visible age change. A tray update runs on its own thread.
 
 use crate::lock::{self, Acquire};
+use crate::refresh_os::{self, RefreshWatch};
 use crate::screen::{self, Action, Clock, Pending, Phase, Role, Screen};
-use crate::watch::{self, Board, PollPhase};
-use crate::{Session, explain};
+use crate::watch::{self, Board, PollPhase, Wake};
+use crate::{Nudge, Session, explain};
 use bistill_lib::{
     Config, Error, Row, Snapshot, SnapshotStatus, caught_up, is_ignored, mark_read, prime,
     read_snapshot, read_store, toggle_ignore, unread_count, write_store,
@@ -16,9 +22,19 @@ use bistill_lib::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
-use tui::{Backend, Buffer};
+use tui::{Backend, Buffer, Event};
+
+/// What the draw thread should do after waiting.
+pub(crate) enum Step {
+    /// An input event, a publish, or a failed poll.
+    Wake(Wake),
+    /// A relative time on screen can change.
+    Age,
+    /// The wake channel is closed.
+    Gone,
+}
 
 /// Why `prepare` or `drive` stopped.
 pub struct Exit {
@@ -70,20 +86,44 @@ pub fn drive(
         snapshot,
         verbose,
     } = prepared;
-    let board = Mutex::new(Board::new(snapshot));
+    let board = Arc::new(Mutex::new(Board::new(snapshot)));
+    let config = Arc::new(config);
     match lock::acquire(&config.state_dir) {
         Ok(Acquire::Holder(held)) => {
+            let (wake_tx, wake_rx) = mpsc::channel();
+            let (nudge_tx, nudge_rx) = mpsc::channel();
+            let refresh = refresh_os::open(&config.state_dir).ok();
             std::thread::scope(|scope| {
-                scope.spawn(|| {
-                    let outcome = watch::poll(session, &config, verbose, &board);
-                    let mut guard = board.lock().unwrap();
+                let paint = wake_tx.clone();
+                let board_poll = Arc::clone(&board);
+                let config_poll = Arc::clone(&config);
+                scope.spawn(move || {
+                    let outcome = watch::poll(
+                        session,
+                        &config_poll,
+                        verbose,
+                        &board_poll,
+                        &nudge_rx,
+                        &paint,
+                    );
+                    let mut guard = board_poll.lock().unwrap();
                     guard.log.push_str(&outcome.stderr);
                     guard.code = outcome.code;
                     if outcome.code != 0 {
                         guard.stop = true;
+                        drop(guard);
+                        let _ = paint.send(Wake::Stop);
                     }
                 });
-                ui(backend, &board, &config, open);
+                if let Some(watch) = refresh.as_ref() {
+                    let nudge = nudge_tx.clone();
+                    scope.spawn(move || relay_refresh(watch, &nudge));
+                }
+                ui(backend, &board, &config, open, wake_tx, wake_rx, &nudge_tx);
+                if let Some(watch) = refresh.as_ref() {
+                    watch.cancel();
+                }
+                let _ = nudge_tx.send(Nudge::Quit);
             });
             let code = board.lock().unwrap().code;
             drop(held);
@@ -119,90 +159,189 @@ fn ui(
     board: &Mutex<Board>,
     config: &Config,
     open: &mut dyn FnMut(&str) -> Result<(), host::Error>,
+    wake_tx: mpsc::Sender<Wake>,
+    wake_rx: mpsc::Receiver<Wake>,
+    nudge_tx: &mpsc::Sender<Nudge>,
 ) -> i32 {
     let mut screen = Screen::new();
-    let mut tray_logged = false;
     let mut seen_fetch = None;
     let shared = Mutex::new(&mut *backend);
-    let (tx, rx) = mpsc::channel();
+    let (tray_tx, tray_rx) = mpsc::channel();
     let running = AtomicBool::new(true);
+    let parking = {
+        let guard = shared.lock().unwrap();
+        guard.parking()
+    };
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            while running.load(Ordering::Relaxed) {
+            host::run_tray(tray_rx, &mut |message| {
+                board.lock().unwrap().log.push_str(message);
+            });
+        });
+        let input_tx = wake_tx;
+        let input_parking = Arc::clone(&parking);
+        let shared_thread = &shared;
+        let running_thread = &running;
+        scope.spawn(move || {
+            let mut seen = 0u64;
+            while running_thread.load(Ordering::Relaxed) {
                 let event = {
-                    let mut guard = shared.lock().unwrap();
-                    guard.poll(Duration::from_millis(30))
+                    let mut guard = shared_thread.lock().unwrap();
+                    guard.poll(Duration::ZERO)
                 };
-                let _ = tx.send(event);
-                if event.is_none() {
-                    std::thread::sleep(Duration::from_millis(2));
+                if let Some(event) = event {
+                    let _ = input_tx.send(Wake::Input(event));
+                } else {
+                    seen = input_parking.park(seen);
                 }
             }
         });
         loop {
-            if board.lock().unwrap().stop {
-                break;
-            }
             let clock = clock();
-            let now_ms = clock.now_ms;
-            let area = {
-                let guard = shared.lock().unwrap();
-                guard.size()
-            };
-            let mut buffer = Buffer::empty(area.width, area.height);
-            {
+            paint_frame(&shared, board, &mut screen, clock);
+            sync_tray(board, config, &mut screen, &mut seen_fetch, &tray_tx);
+            let limit = {
                 let guard = board.lock().unwrap();
-                let role = Role::Holder(holder_phase(&guard));
-                screen::draw(
-                    &mut screen,
-                    &mut buffer,
-                    guard.snapshot.as_ref(),
-                    &role,
-                    clock,
-                );
-            }
-            {
-                let mut guard = shared.lock().unwrap();
-                guard.draw(&buffer);
-            }
-            sync_tray(
+                screen::next_age(guard.snapshot.as_ref(), clock.now_ms)
+            };
+            if take_wakes(
+                &mut screen,
                 board,
                 config,
-                &mut screen,
-                &mut seen_fetch,
-                &mut tray_logged,
-            );
-            let action = match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Some(event)) => {
-                    let guard = board.lock().unwrap();
-                    screen::handle(&mut screen, event, guard.snapshot.as_ref(), now_ms)
-                }
-                Ok(None) | Err(_) => Action::None,
-            };
-            apply_pending(&mut screen, board, config, &mut tray_logged);
-            match action {
-                Action::Quit => {
-                    board.lock().unwrap().stop = true;
-                    break;
-                }
-                Action::Refresh => {
-                    let _ = std::fs::write(config.state_dir.join("refresh"), b"");
-                }
-                Action::Open(url) => {
-                    if let Err(err) = open(&url) {
-                        board
-                            .lock()
-                            .unwrap()
-                            .log
-                            .push_str(&explain(&Error::from(err)));
-                    }
-                }
-                Action::None => {}
+                open,
+                &Out {
+                    tray: &tray_tx,
+                    nudge: nudge_tx,
+                },
+                &wake_rx,
+                limit,
+            ) {
+                break;
             }
         }
         running.store(false, Ordering::Relaxed);
+        parking.unpark();
+        // The tray thread ends when this sender drops. The scope joins it after
+        // this closure returns, so the drop has to happen first.
+        drop(tray_tx);
     });
     board.lock().unwrap().code
+}
+
+pub(crate) struct Out<'a> {
+    pub(crate) tray: &'a mpsc::Sender<u64>,
+    pub(crate) nudge: &'a mpsc::Sender<Nudge>,
+}
+
+/// `true` when the screen should stop.
+pub(crate) fn take_wakes(
+    screen: &mut Screen,
+    board: &Mutex<Board>,
+    config: &Config,
+    open: &mut dyn FnMut(&str) -> Result<(), host::Error>,
+    out: &Out<'_>,
+    wake_rx: &mpsc::Receiver<Wake>,
+    limit: Option<Duration>,
+) -> bool {
+    let mut step = next_step(wake_rx, limit);
+    loop {
+        match step {
+            Step::Gone => return true,
+            Step::Age => return false,
+            Step::Wake(Wake::Stop) => return true,
+            Step::Wake(Wake::Republish) => {}
+            Step::Wake(Wake::Input(event)) => {
+                let now = clock().now_ms;
+                if apply_event(screen, board, config, open, out, event, now) {
+                    return true;
+                }
+            }
+        }
+        step = match wake_rx.try_recv() {
+            Ok(wake) => Step::Wake(wake),
+            Err(_) => return false,
+        };
+    }
+}
+
+/// The next reason to paint. `limit` is the time until a relative age changes.
+pub(crate) fn next_step(wake: &mpsc::Receiver<Wake>, limit: Option<Duration>) -> Step {
+    match limit {
+        Some(limit) => match wake.recv_timeout(limit) {
+            Ok(wake) => Step::Wake(wake),
+            Err(mpsc::RecvTimeoutError::Timeout) => Step::Age,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Step::Gone,
+        },
+        None => match wake.recv() {
+            Ok(wake) => Step::Wake(wake),
+            Err(_) => Step::Gone,
+        },
+    }
+}
+
+fn relay_refresh(watch: &RefreshWatch, nudge: &mpsc::Sender<Nudge>) {
+    while let Ok(true) = watch.wait() {
+        let _ = nudge.send(Nudge::Refresh);
+    }
+}
+
+fn paint_frame(
+    backend: &Mutex<&mut (dyn Backend + Send)>,
+    board: &Mutex<Board>,
+    screen: &mut Screen,
+    clock: Clock,
+) {
+    let area = {
+        let guard = backend.lock().unwrap();
+        guard.size()
+    };
+    let mut buffer = Buffer::empty(area.width, area.height);
+    {
+        let guard = board.lock().unwrap();
+        let role = Role::Holder(holder_phase(&guard));
+        screen::draw(screen, &mut buffer, guard.snapshot.as_ref(), &role, clock);
+    }
+    let mut guard = backend.lock().unwrap();
+    guard.draw(&buffer);
+}
+
+fn apply_event(
+    screen: &mut Screen,
+    board: &Mutex<Board>,
+    config: &Config,
+    open: &mut dyn FnMut(&str) -> Result<(), host::Error>,
+    out: &Out<'_>,
+    event: Event,
+    now_ms: u64,
+) -> bool {
+    let action = {
+        let guard = board.lock().unwrap();
+        screen::handle(screen, event, guard.snapshot.as_ref(), now_ms)
+    };
+    apply_pending(screen, board, config, out.tray);
+    match action {
+        Action::Quit => {
+            board.lock().unwrap().stop = true;
+            let _ = out.nudge.send(Nudge::Quit);
+            true
+        }
+        Action::Refresh => {
+            let _ = std::fs::write(config.state_dir.join("refresh"), b"");
+            let _ = out.nudge.send(Nudge::Refresh);
+            false
+        }
+        Action::Open(url) => {
+            if let Err(err) = open(&url) {
+                board
+                    .lock()
+                    .unwrap()
+                    .log
+                    .push_str(&explain(&Error::from(err)));
+            }
+            false
+        }
+        Action::None => false,
+    }
 }
 
 fn sync_tray(
@@ -210,15 +349,26 @@ fn sync_tray(
     config: &Config,
     screen: &mut Screen,
     seen_fetch: &mut Option<u64>,
-    tray_logged: &mut bool,
+    tray: &mpsc::Sender<u64>,
 ) {
-    let snapshot = board.lock().unwrap().snapshot.clone();
-    let Some(snapshot) = snapshot else {
-        return;
-    };
-    if *seen_fetch == Some(snapshot.fetched_ms) {
+    let fetched = board
+        .lock()
+        .unwrap()
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.fetched_ms);
+    if fetched.is_none() {
         return;
     }
+    if *seen_fetch == fetched {
+        return;
+    }
+    let snapshot = board
+        .lock()
+        .unwrap()
+        .snapshot
+        .clone()
+        .expect("fetched_ms was read from this snapshot");
     *seen_fetch = Some(snapshot.fetched_ms);
     let mut store = match read_store(&config.state_dir) {
         Ok(store) => store,
@@ -232,7 +382,7 @@ fn sync_tray(
     if let Err(err) = write_store(&config.state_dir, &store) {
         board.lock().unwrap().log.push_str(&explain(&err));
     }
-    show_tray(count, &mut board.lock().unwrap().log, tray_logged);
+    enqueue_tray(tray, count);
     let mut floors = BTreeMap::new();
     let mut ignored = BTreeSet::new();
     for row in snapshot.needs_review.iter().chain(snapshot.waiting.iter()) {
@@ -250,7 +400,7 @@ fn apply_pending(
     screen: &mut Screen,
     board: &Mutex<Board>,
     config: &Config,
-    tray_logged: &mut bool,
+    tray: &mpsc::Sender<u64>,
 ) {
     let Some(pending) = screen.take_pending() else {
         return;
@@ -280,7 +430,7 @@ fn apply_pending(
     if let Err(err) = write_store(&config.state_dir, &store) {
         board.lock().unwrap().log.push_str(&explain(&err));
     }
-    show_tray(count, &mut board.lock().unwrap().log, tray_logged);
+    enqueue_tray(tray, count);
     let mut floors = BTreeMap::new();
     let mut ignored = BTreeSet::new();
     for row in snapshot.needs_review.iter().chain(snapshot.waiting.iter()) {
@@ -309,23 +459,8 @@ fn find_row<'a>(snapshot: &'a Snapshot, id: &str) -> Option<&'a Row> {
         .find(|row| row.id == id)
 }
 
-fn show_tray(count: u64, log: &mut String, logged: &mut bool) {
-    record_tray(count, log, logged, host::set_tray);
-}
-
-pub(crate) fn record_tray(
-    count: u64,
-    log: &mut String,
-    logged: &mut bool,
-    set: fn(u64) -> Result<(), host::Error>,
-) {
-    if let Err(err) = set(count) {
-        if !*logged {
-            *logged = true;
-            log.push_str(&err.to_string());
-            log.push('\n');
-        }
-    }
+fn enqueue_tray(tray: &mpsc::Sender<u64>, count: u64) {
+    let _ = tray.send(count);
 }
 
 fn holder_phase(board: &Board) -> Phase {

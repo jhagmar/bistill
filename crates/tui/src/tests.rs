@@ -1105,13 +1105,43 @@ fn contains_sequence(bytes: &[u8], sequence: &[u8]) -> bool {
 #[cfg(unix)]
 #[test]
 fn stdio_refuses_a_redirected_stream() {
-    use std::io::IsTerminal;
-    assert!(!std::io::stdin().is_terminal());
-    assert!(!std::io::stdout().is_terminal());
-    match Terminal::stdio() {
-        Ok(terminal) => drop(terminal),
-        Err(err) => assert_eq!(err.raw_os_error(), Some(25)),
+    use crate::terminal_os::open_noctty;
+    // `/dev/null` is the redirected stream. This process may own a terminal
+    // when `docker compose run` allocates one, so `stdio` runs in a child
+    // whose standard streams are not terminals.
+    let opened = Terminal::pair(
+        open_noctty("/dev/null").unwrap(),
+        open_noctty("/dev/null").unwrap(),
+    );
+    let Err(err) = opened else {
+        panic!("a redirected stream was claimed");
+    };
+    assert_eq!(err.raw_os_error(), Some(25));
+    if std::env::var_os("BISTILL_STDIO_CHILD").is_some() {
+        match Terminal::stdio() {
+            Ok(terminal) => drop(terminal),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(25)),
+        }
+        return;
     }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::stdio_refuses_a_redirected_stream",
+            "--test-threads=1",
+        ])
+        .env("BISTILL_STDIO_CHILD", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -1165,7 +1195,40 @@ fn terminal_restores_the_screen_on_drop_and_panic() {
     assert_eq!(area.height, 10);
     let entered = read_available(&mut master, Duration::from_millis(200));
     assert!(contains_sequence(&entered, ENTER));
+    assert!(ENTER.windows(4).any(|seq| seq == b"?25l"));
+    assert!(LEAVE.windows(4).any(|seq| seq == b"?25h"));
     assert_eq!(local_flags(&probe).unwrap() & ICANON, 0);
+
+    let park = terminal.parking();
+    assert_eq!(crate::terminal_os::dup_raw(-1), -1);
+    assert!(crate::terminal_os::pipe_ends(-1).is_err());
+    let (pipe_r, pipe_w) = crate::terminal_os::pipe_ends(0x80000 | 0o4000).unwrap();
+    crate::terminal_os::close_fd(-1);
+    crate::terminal_os::close_fd(pipe_r);
+    crate::terminal_os::close_fd(pipe_w);
+    let parked = std::thread::spawn({
+        let park = std::sync::Arc::clone(&park);
+        move || park.park(0)
+    });
+    master.write_all(b"z").unwrap();
+    assert_eq!(parked.join().unwrap(), 0);
+    assert_eq!(
+        terminal.poll(Duration::from_millis(200)),
+        Some(Event::Key(KeyCode::Char('z')))
+    );
+    let parked = std::thread::spawn({
+        let park = std::sync::Arc::clone(&park);
+        move || park.park(0)
+    });
+    park.unpark();
+    assert_eq!(parked.join().unwrap(), 0);
+    let parked = std::thread::spawn({
+        let park = std::sync::Arc::clone(&park);
+        move || park.park(0)
+    });
+    crate::terminal_os::raise_winch();
+    assert_eq!(parked.join().unwrap(), 0);
+    drop(park);
 
     let mut buffer = Buffer::empty(20, 10);
     buffer.set_span(
@@ -1258,4 +1321,35 @@ fn terminal_restores_the_screen_on_drop_and_panic() {
     assert!(PROBE.load(Ordering::SeqCst));
     let restored = read_available(&mut panic_master, Duration::from_millis(200));
     assert!(contains_sequence(&restored, LEAVE));
+    crate::terminal_os::raise_winch();
+}
+
+#[test]
+fn gate_parks_until_unpark_and_times_out() {
+    let gate = Gate::new();
+    assert!(gate.park_for(0, Duration::from_millis(20)).is_none());
+    let waiting = gate.clone();
+    let thread = std::thread::spawn(move || waiting.park(0));
+    gate.unpark();
+    assert_eq!(thread.join().unwrap(), 1);
+    assert_eq!(gate.park_for(0, Duration::from_millis(20)).unwrap(), 1);
+    let backend = TestBackend::new(1, 1);
+    let park = backend.parking();
+    park.unpark();
+    assert_eq!(park.park(0), 1);
+}
+
+#[test]
+fn styled_lines_stop_at_the_frame() {
+    let mut buffer = Buffer::empty(4, 2);
+    let style = Style::default();
+    draw_styled_lines(&mut buffer, rect(0, 0, 0, 2), &[("ab", style)]);
+    draw_styled_lines(&mut buffer, rect(0, 0, 4, 0), &[("ab", style)]);
+    draw_styled_lines(
+        &mut buffer,
+        rect(0, 0, 4, 1),
+        &[("one", style), ("two", style)],
+    );
+    assert_eq!(symbol(&buffer, 0, 0), "o");
+    assert_eq!(symbol(&buffer, 0, 1), " ");
 }

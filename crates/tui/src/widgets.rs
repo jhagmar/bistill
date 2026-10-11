@@ -319,6 +319,46 @@ pub fn draw_tabs(
     }
 }
 
+/// Draw each logical line in `lines` with that line's style, wrapped to `area`.
+pub fn draw_styled_lines(buffer: &mut Buffer, area: Rect, lines: &[(&str, Style)]) {
+    if area.width == 0 {
+        return;
+    }
+    if area.height == 0 {
+        return;
+    }
+    let mut row = 0u16;
+    let width = usize::from(area.width);
+    for (text, style) in lines {
+        for line in wrap_paragraph(text, width) {
+            if row >= area.height {
+                return;
+            }
+            buffer.set_span(
+                area.x,
+                area.y.saturating_add(row),
+                &Span {
+                    style: *style,
+                    content: &line,
+                },
+                area.width,
+            );
+            row = row.saturating_add(1);
+        }
+    }
+}
+
+fn wrap_paragraph(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, next) = take_line(rest, width);
+        lines.push(line);
+        rest = next;
+    }
+    lines
+}
+
 /// Draw `text` wrapped to `area`.
 pub fn draw_paragraph(buffer: &mut Buffer, area: Rect, text: &str, style: Style) {
     if area.width > 0 && area.height > 0 {

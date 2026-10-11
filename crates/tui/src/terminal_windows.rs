@@ -7,7 +7,7 @@
 #![allow(unsafe_code)]
 
 use std::io;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 const STD_INPUT_HANDLE: u32 = -10i32 as u32;
@@ -47,6 +47,20 @@ unsafe extern "system" {
     fn SetConsoleMode(handle: *mut core::ffi::c_void, mode: u32) -> i32;
     fn GetConsoleScreenBufferInfo(handle: *mut core::ffi::c_void, info: *mut ConsoleInfo) -> i32;
     fn WaitForSingleObject(handle: *mut core::ffi::c_void, millis: u32) -> u32;
+    fn WaitForMultipleObjects(
+        count: u32,
+        handles: *const *mut core::ffi::c_void,
+        wait_all: i32,
+        millis: u32,
+    ) -> u32;
+    fn CreateEventW(
+        attrs: *mut core::ffi::c_void,
+        manual: i32,
+        initial: i32,
+        name: *const u16,
+    ) -> *mut core::ffi::c_void;
+    fn SetEvent(handle: *mut core::ffi::c_void) -> i32;
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
     fn ReadFile(
         handle: *mut core::ffi::c_void,
         buf: *mut u8,
@@ -76,6 +90,7 @@ static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
 pub struct Console {
     input: isize,
     output: isize,
+    wake: isize,
 }
 
 impl Console {
@@ -111,10 +126,42 @@ impl Console {
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         read_handle(self.input, buf)
     }
+
+    /// A park that blocks on console input and on [`Console::unpark`](Self::parking).
+    pub fn parking(&self) -> Arc<dyn crate::backend::Park> {
+        Arc::new(WinPark {
+            input: self.input,
+            wake: self.wake,
+        })
+    }
+}
+
+struct WinPark {
+    input: isize,
+    wake: isize,
+}
+
+impl crate::backend::Park for WinPark {
+    fn park(&self, _seen: u64) -> u64 {
+        let handles = [as_handle(self.input), as_handle(self.wake)];
+        unsafe {
+            WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX);
+        }
+        0
+    }
+
+    fn unpark(&self) {
+        unsafe {
+            SetEvent(as_handle(self.wake));
+        }
+    }
 }
 
 impl Drop for Console {
     fn drop(&mut self) {
+        unsafe {
+            CloseHandle(as_handle(self.wake));
+        }
         disarm();
     }
 }
@@ -124,13 +171,21 @@ fn enable(input: isize, output: isize) -> io::Result<Console> {
     let saved_out = console_mode(output)?;
     set_mode(input, ENABLE_VIRTUAL_TERMINAL_INPUT)?;
     set_mode(output, saved_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
+    let wake = unsafe { CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null()) };
+    if wake.is_null() {
+        return Err(io::Error::last_os_error());
+    }
     *lock_armed() = Some(Armed {
         input,
         output,
         saved_in,
         saved_out,
     });
-    Ok(Console { input, output })
+    Ok(Console {
+        input,
+        output,
+        wake: wake as isize,
+    })
 }
 
 /// Leaves the alternate screen and restores the saved console modes.

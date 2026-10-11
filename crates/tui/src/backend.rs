@@ -6,6 +6,7 @@
 use crate::buffer::{Buffer, Cell};
 use crate::layout::Rect;
 use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// A key the terminal reported.
@@ -92,6 +93,61 @@ pub enum Event {
     },
 }
 
+/// Blocks until [`Park::unpark`] or until a descriptor this park owns is readable.
+pub trait Park: Send + Sync {
+    /// Waits until the generation is no longer `seen`. Returns the generation now.
+    fn park(&self, seen: u64) -> u64;
+    /// Wakes every thread blocked in [`Park::park`].
+    fn unpark(&self);
+}
+
+/// A generation counter. [`Park::park`] waits until [`Park::unpark`] moves it.
+pub struct Gate {
+    state: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Gate {
+    /// A gate whose generation is zero.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Gate {
+            state: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// [`Park::park`] with a deadline. `None` means `limit` elapsed on `seen`.
+    pub fn park_for(&self, seen: u64, limit: Duration) -> Option<u64> {
+        let guard = self.state.lock().unwrap();
+        let (guard, status) = self
+            .cv
+            .wait_timeout_while(guard, limit, |generation| *generation == seen)
+            .unwrap();
+        if status.timed_out() && *guard == seen {
+            None
+        } else {
+            Some(*guard)
+        }
+    }
+}
+
+impl Park for Gate {
+    fn park(&self, seen: u64) -> u64 {
+        let guard = self.state.lock().unwrap();
+        let guard = self
+            .cv
+            .wait_while(guard, |generation| *generation == seen)
+            .unwrap();
+        *guard
+    }
+
+    fn unpark(&self) {
+        let mut guard = self.state.lock().unwrap();
+        *guard = guard.wrapping_add(1);
+        self.cv.notify_all();
+    }
+}
+
 /// A surface that presents a buffer and yields events.
 pub trait Backend: Send {
     /// The grid size in cells.
@@ -100,16 +156,19 @@ pub trait Backend: Send {
     fn draw(&mut self, buffer: &Buffer);
     /// The next event, or nothing when `timeout` elapses with the queue empty.
     fn poll(&mut self, timeout: Duration) -> Option<Event>;
+    /// A park the input thread can block on without holding this backend.
+    fn parking(&self) -> Arc<dyn Park>;
 }
 
 /// An in-memory grid. Tests push events and read cells.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct TestBackend {
     width: u16,
     height: u16,
     cells: Vec<Cell>,
     writes: Vec<u32>,
     events: VecDeque<Event>,
+    gate: Arc<Gate>,
 }
 
 impl TestBackend {
@@ -122,6 +181,7 @@ impl TestBackend {
             cells: vec![Cell::blank(); count],
             writes: vec![0; count],
             events: VecDeque::new(),
+            gate: Gate::new(),
         }
     }
 
@@ -149,6 +209,38 @@ impl TestBackend {
     }
 }
 
+impl PartialEq for TestBackend {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.width,
+            self.height,
+            &self.cells,
+            &self.writes,
+            &self.events,
+        ) == (
+            other.width,
+            other.height,
+            &other.cells,
+            &other.writes,
+            &other.events,
+        )
+    }
+}
+
+impl Eq for TestBackend {}
+
+impl std::fmt::Debug for TestBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestBackend")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("cells", &self.cells)
+            .field("writes", &self.writes)
+            .field("events", &self.events)
+            .finish()
+    }
+}
+
 impl Backend for TestBackend {
     fn size(&self) -> Rect {
         Rect {
@@ -173,10 +265,15 @@ impl Backend for TestBackend {
                 self.writes[index] += 1;
             }
         }
+        self.gate.unpark();
     }
 
     fn poll(&mut self, timeout: Duration) -> Option<Event> {
         let _ = timeout;
         self.events.pop_front()
+    }
+
+    fn parking(&self) -> Arc<dyn Park> {
+        self.gate.clone()
     }
 }

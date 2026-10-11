@@ -829,6 +829,25 @@ fn glyph_char(glyph: &tui::Glyph) -> char {
     }
 }
 
+fn find_style(buffer: &tui::Buffer, word: &str) -> tui::Style {
+    style_of(buffer, word).into_iter().next().unwrap()
+}
+
+fn style_of(buffer: &tui::Buffer, word: &str) -> Vec<tui::Style> {
+    let mut found = Vec::new();
+    for y in 0..buffer.height() {
+        let text = row_text(buffer, y);
+        let mut start = 0usize;
+        while let Some(at) = text[start..].find(word) {
+            let column = text[..start + at].chars().count();
+            let x = u16::try_from(column).unwrap();
+            found.push(buffer.get(x, y).unwrap().style);
+            start += at + word.len();
+        }
+    }
+    found
+}
+
 fn row_text(buffer: &tui::Buffer, y: u16) -> String {
     (0..buffer.width())
         .map(|x| glyph_char(&buffer.get(x, y).unwrap().glyph))
@@ -958,9 +977,10 @@ fn screen_draws_both_layouts_and_status_lines() {
     let top = row_text(&wide, 0);
     assert!(top.contains("Needs review"));
     assert!(top.contains("Waiting"));
-    assert_eq!(row_of(&wide, "Detail"), Some(1));
+    assert!(row_text(&wide, 1).contains("repo#12"));
     let shown = grid_text(&wide);
     assert!(shown.contains("and 3 more"));
+    assert!(shown.contains("No activity yet."));
     assert!(shown.contains("PRJ/repo#12"));
     assert!(shown.contains("Fix the pipe"));
     assert!(shown.contains("45s"));
@@ -973,11 +993,96 @@ fn screen_draws_both_layouts_and_status_lines() {
     assert!(shown.contains("successful"));
     assert!(shown.contains("in progress"));
     assert!(shown.contains("1/6"));
-    assert!(shown.contains("R0 UNAPPROVED"));
-    assert!(shown.contains("R1 NEEDS_WORK"));
-    assert!(shown.contains("R2 APPROVED"));
     assert!(row_text(&wide, 23).contains("Fetching from Bitbucket..."));
-    assert!(wide.get(1, 2).unwrap().style.reverse);
+    let picked = wide.get(1, 2).unwrap().style;
+    assert_eq!(picked.fg, Some(tui::Color::BrightWhite));
+    assert_eq!(picked.bg, Some(tui::Color::Blue));
+    assert!(!picked.reverse);
+    assert_eq!(find_style(&wide, "draft").fg, Some(tui::Color::Magenta));
+    assert_eq!(find_style(&wide, "in progress").fg, Some(tui::Color::Cyan));
+    assert_eq!(
+        find_style(&wide, "Waiting").fg,
+        Some(tui::Color::BrightBlack)
+    );
+    assert_eq!(
+        find_style(&wide, "PRJ/widget#13").fg,
+        Some(tui::Color::BrightBlack)
+    );
+    assert_eq!(find_style(&wide, "1/6").fg, Some(tui::Color::BrightBlack));
+    assert_eq!(
+        find_style(&wide, "and 3 more").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert!(find_style(&wide, "and 3 more").bold);
+    assert_eq!(wide.get(0, 23).unwrap().style.fg, Some(tui::Color::Cyan));
+    let keys_at = u16::try_from(row_text(&wide, 23).find("j/k").unwrap()).unwrap();
+    assert!(wide.get(keys_at, 23).unwrap().style.fg.is_none());
+    assert!(wide.get(keys_at, 23).unwrap().style.bold);
+    let mut probe = screen::Screen::new();
+    let _ = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let shifted = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&shifted, 1).contains("widget#13"));
+    assert!(side_text(&shifted, 80).contains("No activity yet."));
+    assert!(
+        style_of(&shifted, "failed")
+            .iter()
+            .any(|style| { style.fg == Some(tui::Color::BrightRed) && style.bold })
+    );
+    let mut ignored = std::collections::BTreeSet::new();
+    ignored.insert("PRJ/repo/16".to_owned());
+    probe.set_marks(std::collections::BTreeMap::new(), ignored);
+    let badged = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        find_style(&badged, "ignored").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Tab), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let _ = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let waiting = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        find_style(&waiting, "stale").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('k')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let needs_work = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(
+        style_of(&needs_work, "needs work")
+            .iter()
+            .any(|style| { style.fg == Some(tui::Color::BrightRed) })
+    );
+    let mut ship = screen::Screen::new();
+    let _ = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    for _ in 0..2 {
+        assert_eq!(
+            act(&mut ship, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+            screen::Action::None
+        );
+    }
+    let building = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&building, 1).contains("repo#15"));
+    assert!(side_text(&building, 80).contains("No activity yet."));
+    for _ in 0..3 {
+        assert_eq!(
+            act(&mut ship, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+            screen::Action::None
+        );
+    }
+    let merged = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&merged, 1).contains("repo#18"));
 
     let again = draw_screen(&mut screen, 160, 24, Some(&snapshot), &holder, 0);
     assert!(grid_text(&again).contains("1/6"));
@@ -990,9 +1095,9 @@ fn screen_draws_both_layouts_and_status_lines() {
         &holder,
         0,
     );
-    let detail = row_of(&stacked, "Detail").unwrap();
+    let detail = row_of(&stacked, "No activity yet.").unwrap();
     assert!(detail > 1);
-    assert!(!row_text(&stacked, 1).contains("Detail"));
+    assert!(!row_text(&stacked, 1).contains("No activity yet."));
 
     let ready = screen::Role::Holder(screen::Phase::Ready);
     let ready_grid = draw_screen(
@@ -1015,6 +1120,10 @@ fn screen_draws_both_layouts_and_status_lines() {
         0,
     );
     assert!(row_text(&auth_grid, 23).contains("Token rejected."));
+    assert_eq!(
+        auth_grid.get(0, 23).unwrap().style.fg,
+        Some(tui::Color::BrightRed)
+    );
 
     let tls = screen::Role::Holder(screen::Phase::Tls);
     let tls_grid = draw_screen(
@@ -1050,6 +1159,10 @@ fn screen_draws_both_layouts_and_status_lines() {
         0,
     );
     assert!(row_text(&limited_grid, 23).contains("Rate limited."));
+    assert_eq!(
+        limited_grid.get(0, 23).unwrap().style.fg,
+        Some(tui::Color::BrightYellow)
+    );
 
     let loading = draw_screen(&mut screen::Screen::new(), 160, 24, None, &holder, 0);
     let loading_text = grid_text(&loading);
@@ -1060,6 +1173,10 @@ fn screen_draws_both_layouts_and_status_lines() {
     let empty = sample_snapshot(Vec::new(), Vec::new());
     let empty_grid = draw_screen(&mut screen::Screen::new(), 160, 24, Some(&empty), &ready, 0);
     assert!(grid_text(&empty_grid).contains("Nothing needs your attention."));
+    assert_eq!(
+        find_style(&empty_grid, "Nothing").fg,
+        Some(tui::Color::Green)
+    );
 
     let mut tiny = screen::Screen::new();
     let _ = draw_screen(&mut tiny, 0, 4, Some(&snapshot), &holder, 0);
@@ -1129,6 +1246,8 @@ fn screen_keys_filter_help_and_mouse() {
     );
     let draft = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
     assert!(grid_text(&draft).contains("2/6"));
+    assert!(side_text(&draft, 80).contains("widget#13"));
+    assert!(side_text(&draft, 80).contains("No activity yet."));
     assert!(!side_text(&draft, 80).contains("build "));
 
     let _ = act(
@@ -1138,7 +1257,8 @@ fn screen_keys_filter_help_and_mouse() {
         0,
     );
     let ship = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&ship, 80).contains("build in progress"));
+    assert!(side_text(&ship, 80).contains("repo#15"));
+    assert!(side_text(&ship, 80).contains("No activity yet."));
 
     let _ = act(
         &mut screen,
@@ -1147,11 +1267,10 @@ fn screen_keys_filter_help_and_mouse() {
         0,
     );
     let quiet = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&quiet, 80).contains("Quiet change"));
-    assert!(side_text(&quiet, 80).contains("unanswered as author 0"));
-    assert!(!side_text(&quiet, 80).contains("build "));
-    assert!(!side_text(&quiet, 80).contains("conflicted"));
-    assert!(!side_text(&quiet, 80).contains("mergeable"));
+    assert!(side_text(&quiet, 80).contains("repo#16"));
+    assert!(side_text(&quiet, 80).contains("No activity yet."));
+    assert!(!side_text(&quiet, 80).contains("Quiet change"));
+    assert!(!side_text(&quiet, 80).contains("unanswered"));
 
     let _ = act(
         &mut screen,
@@ -1177,8 +1296,10 @@ fn screen_keys_filter_help_and_mouse() {
     );
     let marked = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
     assert!(grid_text(&marked).contains("6/6"));
-    assert!(side_text(&marked, 80).contains("build successful"));
-    assert!(side_text(&marked, 80).contains("conflicted"));
+    assert!(side_text(&marked, 80).contains("repo#18"));
+    assert!(side_text(&marked, 80).contains("No activity yet."));
+    assert!(!side_text(&marked, 80).contains("successful"));
+    assert!(!side_text(&marked, 80).contains("conflicted"));
     assert_eq!(
         act(&mut screen, key(tui::KeyCode::Enter), Some(&snapshot), 0),
         screen::Action::Open("https://git.example.invalid/pull/18".to_owned())
@@ -1633,43 +1754,32 @@ fn screen_scrolls_the_focused_pane() {
     let top = draw_screen(&mut short, 160, 8, Some(&snapshot), &ready, 0);
     assert!(table_has(&top, "PRJ/repo#12"));
 
+    let mut fed = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    fed.events = feed_events();
+    let snapshot = sample_snapshot(vec![fed], Vec::new());
     let mut screen = screen::Screen::new();
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    for _ in 0..3 {
-        let _ = act(
-            &mut screen,
-            key(tui::KeyCode::Char('j')),
-            Some(&snapshot),
-            0,
-        );
-    }
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
+    let _ = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
     assert_eq!(
         act(&mut screen, press_at(81, 4), Some(&snapshot), 10),
         screen::Action::None
     );
+    let head = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    let head_side = side_text(&head, 80);
+    assert!(head_side.contains("You commented"));
+    assert!(!head_side.contains("tail of the feed"));
     let _ = act(
         &mut screen,
         tui::Event::Wheel {
             direction: tui::Wheel::Down,
-            column: 81,
-            row: 4,
+            column: 90,
+            row: 6,
         },
         Some(&snapshot),
         0,
     );
-    let quiet = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&quiet, 80).contains("Quiet change"));
-    assert_eq!(
-        act(&mut screen, press_at(1, 2), Some(&snapshot), 20),
-        screen::Action::None
-    );
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert_eq!(
-        act(&mut screen, press_at(81, 4), Some(&snapshot), 30),
-        screen::Action::None
-    );
-    for _ in 0..20 {
+    let stepped = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert_ne!(side_text(&stepped, 80), head_side);
+    for _ in 0..40 {
         let _ = act(
             &mut screen,
             tui::Event::Wheel {
@@ -1681,16 +1791,9 @@ fn screen_scrolls_the_focused_pane() {
             0,
         );
     }
-    let tail = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(!side_text(&tail, 80).contains("R0 UNAPPROVED"));
-    assert!(side_text(&tail, 80).contains("feature -> main"));
-    assert!(side_text(&tail, 80).contains("unanswered as author 2"));
-    assert!(side_text(&tail, 80).contains("unanswered as reviewer 3"));
-    assert!(side_text(&tail, 80).contains("open tasks 4"));
-    assert!(side_text(&tail, 80).contains("build failed"));
-    assert!(side_text(&tail, 80).contains("conflicted"));
-    assert!(side_text(&tail, 80).contains("mergeable"));
-    assert!(side_text(&tail, 80).contains("https://git.example.invalid/pull/12"));
+    let tail = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert!(side_text(&tail, 80).contains("tail of the feed"));
+    assert!(!side_text(&tail, 80).contains("You commented"));
     let before = side_text(&tail, 80);
     let _ = act(
         &mut screen,
@@ -1702,9 +1805,9 @@ fn screen_scrolls_the_focused_pane() {
         Some(&snapshot),
         0,
     );
-    let same = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
+    let same = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
     assert_eq!(side_text(&same, 80), before);
-    for _ in 0..20 {
+    for _ in 0..40 {
         let _ = act(
             &mut screen,
             tui::Event::Wheel {
@@ -1716,20 +1819,8 @@ fn screen_scrolls_the_focused_pane() {
             0,
         );
     }
-    let head = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&head, 80).contains("R0 UNAPPROVED"));
-    let _ = act(
-        &mut screen,
-        tui::Event::Wheel {
-            direction: tui::Wheel::Up,
-            column: 90,
-            row: 6,
-        },
-        Some(&snapshot),
-        0,
-    );
-    let still = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&still, 80).contains("R0 UNAPPROVED"));
+    let back = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert!(side_text(&back, 80).contains("You commented"));
 }
 
 fn table_has(buffer: &tui::Buffer, needle: &str) -> bool {
@@ -1763,6 +1854,215 @@ fn screen_formats_clock_text() {
     assert_eq!(screen::absolute(0, -60), "1970-01-01 00:00");
     assert_eq!(screen::absolute(0, 3_600), "1970-01-01 01:00");
     assert_eq!(screen::absolute(1_000_000_000_000, 0), "2001-09-09 01:46");
+    assert_eq!(screen::ago(SCREEN_NOW, SCREEN_NOW), "just now");
+    assert_eq!(screen::ago(SCREEN_NOW - 59_000, SCREEN_NOW), "just now");
+    assert_eq!(screen::ago(SCREEN_NOW - 60_000, SCREEN_NOW), "1m ago");
+    assert_eq!(
+        screen::ago(SCREEN_NOW - 3 * 3_600_000, SCREEN_NOW),
+        "3h ago"
+    );
+    assert_eq!(
+        screen::ago(SCREEN_NOW - 5 * 86_400_000, SCREEN_NOW),
+        "5d ago"
+    );
+    assert_eq!(screen::ago(SCREEN_NOW + 1_000, SCREEN_NOW), "just now");
+}
+
+fn activity(
+    id: u64,
+    age_ms: u64,
+    slug: &str,
+    name: &str,
+    kind: bistill_lib::EventKind,
+    text: &str,
+) -> bistill_lib::Event {
+    bistill_lib::Event {
+        id,
+        created_ms: SCREEN_NOW.saturating_sub(age_ms),
+        actor_slug: slug.to_owned(),
+        actor_name: name.to_owned(),
+        kind,
+        text: text.to_owned(),
+        thread: Vec::new(),
+        added_user: false,
+    }
+}
+
+fn feed_events() -> Vec<bistill_lib::Event> {
+    use bistill_lib::EventKind;
+    vec![
+        activity(
+            10,
+            30_000,
+            "jcitizen",
+            "Jane",
+            EventKind::Commented,
+            "Looks good",
+        ),
+        activity(
+            9,
+            3 * 3_600_000,
+            "sam",
+            "Sam",
+            EventKind::Approved,
+            "Ship it",
+        ),
+        activity(8, 0, "jcitizen", "Jane", EventKind::Approved, ""),
+        activity(7, 120_000, "pat", "Pat", EventKind::Pushed, "valve"),
+        activity(6, 0, "jcitizen", "Jane", EventKind::Pushed, ""),
+        activity(5, 5 * 86_400_000, "pat", "Pat", EventKind::Reopened, ""),
+        activity(4, 0, "jcitizen", "Jane", EventKind::Reopened, ""),
+        activity(3, 0, "pat", "Pat", EventKind::Added, ""),
+        activity(2, 0, "pat", "Pat", EventKind::Other, "noise"),
+        activity(
+            1,
+            9 * 86_400_000,
+            "pat",
+            "Pat",
+            EventKind::Commented,
+            "tail of the feed",
+        ),
+    ]
+}
+
+#[test]
+fn screen_keeps_the_pull_request_when_rows_move() {
+    use bistill_lib::EventKind;
+    let ready = screen::Role::Holder(screen::Phase::Ready);
+    let fetching = screen::Role::Holder(screen::Phase::Fetching);
+    let mut fix = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    fix.events = vec![activity(
+        4,
+        3 * 3_600_000,
+        "sam",
+        "Sam",
+        EventKind::Approved,
+        "Looks good",
+    )];
+    let mut draft = sample_row("PRJ", "widget", 13, "Draft note", true, false, false);
+    draft.events = vec![
+        activity(
+            9,
+            30_000,
+            "pat",
+            "Pat",
+            EventKind::Commented,
+            "Please look at the valve",
+        ),
+        activity(1, 0, "jcitizen", "Jane", EventKind::Commented, "mine"),
+    ];
+    let mut screen = screen::Screen::new();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(draft.id.clone(), 2);
+    screen.set_marks(floors, std::collections::BTreeSet::new());
+    let ordered = sample_snapshot(vec![fix.clone(), draft.clone()], Vec::new());
+    let _ = draw_screen(&mut screen, 160, 24, Some(&ordered), &ready, 0);
+    assert_eq!(
+        act(&mut screen, key(tui::KeyCode::Char('j')), Some(&ordered), 0),
+        screen::Action::None
+    );
+    let picked = draw_screen(&mut screen, 160, 24, Some(&ordered), &ready, 0);
+    assert!(side_text(&picked, 80).contains("widget#13"));
+    assert!(side_text(&picked, 80).contains("Comment from Pat"));
+    assert!(side_text(&picked, 80).contains("Please look at the valve"));
+    assert!(side_text(&picked, 80).contains("You commented"));
+    assert!(side_text(&picked, 80).contains("new"));
+    assert!(!side_text(&picked, 80).contains("Draft note"));
+    assert!(!side_text(&picked, 80).contains("http"));
+    assert_eq!(find_style(&picked, "new").fg, Some(tui::Color::Green));
+    assert!(find_style(&picked, "new").bold);
+    let swapped = sample_snapshot(vec![draft.clone(), fix.clone()], Vec::new());
+    let stayed = draw_screen(&mut screen, 160, 24, Some(&swapped), &ready, 0);
+    assert!(side_text(&stayed, 80).contains("widget#13"));
+    assert!(side_text(&stayed, 80).contains("Comment from Pat"));
+    assert_eq!(find_style(&stayed, "Draft note").bg, Some(tui::Color::Blue));
+    let gone = sample_snapshot(vec![fix.clone()], Vec::new());
+    let held = draw_screen(&mut screen, 160, 24, Some(&gone), &fetching, 0);
+    assert!(side_text(&held, 80).contains("widget#13"));
+    assert!(side_text(&held, 80).contains("Please look at the valve"));
+    assert_ne!(find_style(&held, "Fix the pipe").bg, Some(tui::Color::Blue));
+    let adopted = draw_screen(&mut screen, 160, 24, Some(&gone), &ready, 0);
+    assert!(side_text(&adopted, 80).contains("repo#12"));
+    assert!(side_text(&adopted, 80).contains("Approved by Sam"));
+    assert!(side_text(&adopted, 80).contains("3h ago"));
+    assert_eq!(
+        find_style(&adopted, "Fix the pipe").bg,
+        Some(tui::Color::Blue)
+    );
+
+    let narrow = rule_parts(true, "3h ago", 3);
+    assert_eq!(narrow, vec!["new".to_owned()]);
+    assert!(rule_parts(true, "3h ago", 0).is_empty());
+    let dashes = rule_parts(false, "", 4);
+    assert!(dashes.iter().any(|text| text.contains('─')));
+    assert_eq!(
+        screen::verb_line(
+            &activity(1, 0, "x", "Pat", EventKind::Other, "noise"),
+            "jcitizen"
+        ),
+        ""
+    );
+    assert!(screen::wrap_text("", 0).is_empty());
+    assert_eq!(
+        screen::wrap_text("ab", 1),
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+    assert_eq!(
+        screen::wrap_text("a\n\nb", 10),
+        vec!["a".to_owned(), String::new(), "b".to_owned()]
+    );
+    assert_eq!(
+        screen::wrap_text("a字", 2),
+        vec!["a".to_owned(), "字".to_owned()]
+    );
+    let mut buffer = tui::Buffer::empty(4, 2);
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 2,
+        },
+        &[],
+    );
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 0,
+        },
+        &[],
+    );
+    let row = vec![
+        screen::FeedSpan {
+            text: "abcd".to_owned(),
+            style: tui::Style::default(),
+        },
+        screen::FeedSpan {
+            text: "z".to_owned(),
+            style: tui::Style::default(),
+        },
+    ];
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+        &[row],
+    );
+}
+
+fn rule_parts(unread: bool, time: &str, width: usize) -> Vec<String> {
+    screen::rule_spans(unread, time, width)
+        .into_iter()
+        .map(|span| span.text)
+        .collect()
 }
 
 fn watch_dir(name: &str) -> PathBuf {
@@ -1784,6 +2084,7 @@ struct Poller {
     polls: u32,
     stop_after_pauses: Option<u32>,
     refresh: bool,
+    quit: bool,
     readonly_on: Option<u32>,
     state: PathBuf,
     cached: Vec<usize>,
@@ -1836,13 +2137,22 @@ impl Session for Poller {
         self.now
     }
 
-    fn pause(&mut self, duration: Duration) {
+    fn pause(&mut self, duration: Duration, _wake: &std::sync::mpsc::Receiver<Nudge>) -> Paused {
         self.pauses.push(duration.as_millis() as u64);
+        if self.quit {
+            return Paused::Quit;
+        }
+        let wrote = self.refresh;
         if self.refresh {
             fs::write(self.state.join("refresh"), b"").unwrap();
             self.refresh = false;
         }
         self.now += self.jump;
+        if wrote {
+            Paused::Refresh
+        } else {
+            Paused::Elapsed
+        }
     }
 
     fn again(&mut self) -> bool {
@@ -1866,6 +2176,7 @@ fn poller(cwd: &Path, steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Po
         polls: 0,
         stop_after_pauses: None,
         refresh: false,
+        quit: false,
         readonly_on: None,
         state: cwd.to_owned(),
         cached: Vec::new(),
@@ -1908,7 +2219,10 @@ fn run_watch(cwd: &Path, poller: &mut Poller, verbose: bool) -> (i32, String) {
         Err(err) => return (1, explain(&Error::from(err))),
     };
     let board = std::sync::Mutex::new(watch::Board::new(previous));
-    let outcome = watch::poll(poller, &config, verbose, &board);
+    let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
+    let (paint_tx, _paint_rx) = std::sync::mpsc::channel();
+    let outcome = watch::poll(poller, &config, verbose, &board, &nudge_rx, &paint_tx);
+    drop(nudge_tx);
     drop(held);
     (outcome.code, outcome.stderr)
 }
@@ -1927,7 +2241,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     assert!(stderr.contains("Bearer ***"));
     assert!(!stderr.contains("secret-token"));
     assert_eq!(session.cached, vec![0, 1]);
-    assert_eq!(session.pauses, vec![1_000]);
+    assert_eq!(session.pauses, vec![15_000]);
     assert!(!cwd.join("poll.lock").exists());
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.needs_review.len(), 1);
@@ -1955,7 +2269,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.stop_after_polls = 3;
     let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
-    assert_eq!(session.pauses, vec![1_000, 1_000, 1_000]);
+    assert_eq!(session.pauses, vec![15_000, 30_000, 10_000]);
     assert!(!cwd.join("snapshot.json").exists());
 
     let cwd = watch_dir("watch-refresh");
@@ -1965,7 +2279,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.refresh = true;
     let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
-    assert_eq!(session.pauses, vec![1_000]);
+    assert_eq!(session.pauses, vec![120_000]);
     assert!(!cwd.join("refresh").exists());
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Ok);
@@ -1994,6 +2308,14 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     assert_eq!(code, 0);
     assert_eq!(session.pauses.len(), 2);
 
+    let cwd = watch_dir("watch-quit");
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    session.stop_after_polls = 2;
+    session.quit = true;
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(session.polls, 1);
+
     let cwd = watch_dir("watch-missing");
     let mut session = poller(
         &cwd,
@@ -2017,6 +2339,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         "watch-floor",
         "watch-cap",
         "watch-missing",
+        "watch-quit",
     ] {
         let _ = fs::remove_dir_all(
             std::env::temp_dir().join(format!("bistill-bin-{cwd}-{}", std::process::id())),
@@ -2186,8 +2509,244 @@ fn live_poll_reports_a_missing_program() {
     ));
     assert!(Live.again());
     assert!(Live.now_ms() > 0);
-    Live.pause(Duration::from_millis(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    assert!(matches!(
+        Live.pause(Duration::from_millis(0), &rx),
+        Paused::Elapsed
+    ));
+    drop(tx);
+    assert!(matches!(
+        Live.pause(Duration::from_millis(0), &rx),
+        Paused::Quit
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Nudge::Refresh).unwrap();
+    assert!(matches!(
+        Live.pause(Duration::from_secs(2), &rx),
+        Paused::Refresh
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Nudge::Quit).unwrap();
+    assert!(matches!(
+        Live.pause(Duration::from_secs(2), &rx),
+        Paused::Quit
+    ));
     fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn draw_waits_for_a_publish_an_age_and_quit() {
+    let cwd = watch_dir("draw-wait");
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
+    let board = std::sync::Mutex::new(watch::Board::new(None));
+    let (tray_tx, _tray_rx) = std::sync::mpsc::channel();
+    let (nudge_tx, _nudge_rx) = std::sync::mpsc::channel();
+    let mut screen = screen::Screen::new();
+    let mut open = |_url: &str| Ok(());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = app::Out {
+        tray: &tray_tx,
+        nudge: &nudge_tx,
+    };
+    assert!(!app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::ZERO),
+    ));
+    drop(tx);
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::ZERO),
+    ));
+    assert!(matches!(app::next_step(&rx, None), app::Step::Gone));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Republish).unwrap();
+    assert!(matches!(
+        app::next_step(&rx, None),
+        app::Step::Wake(watch::Wake::Republish)
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Stop).unwrap();
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Republish).unwrap();
+    tx.send(watch::Wake::Input(tui::Event::Key(tui::KeyCode::Char('?'))))
+        .unwrap();
+    assert!(!app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Input(tui::Event::Key(tui::KeyCode::Char('q'))))
+        .unwrap();
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    assert!(board.lock().unwrap().stop);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn next_age_tracks_the_visible_unit() {
+    assert!(screen::next_age(None, 1_000).is_none());
+    let empty = sample_snapshot(Vec::new(), Vec::new());
+    assert!(screen::next_age(Some(&empty), 1_000).is_none());
+    let now = 10_000_000_000u64;
+    let mut future = sample_row("PRJ", "repo", 1, "Later", false, false, false);
+    future.updated_ms = now + 5_000;
+    let ahead = sample_snapshot(vec![future], Vec::new());
+    assert!(screen::next_age(Some(&ahead), now).is_none());
+
+    let cases = [
+        (0u64, 1_000u64),
+        (500, 500),
+        (90_000, 30_000),
+        (7_200_000, 3_600_000),
+        (5 * 86_400_000, 86_400_000),
+    ];
+    for (elapsed, step) in cases {
+        let mut row = sample_row("PRJ", "repo", 1, "Aged", false, false, false);
+        row.updated_ms = now - elapsed;
+        let snapshot = sample_snapshot(vec![row], Vec::new());
+        assert_eq!(
+            screen::next_age(Some(&snapshot), now),
+            Some(Duration::from_millis(step)),
+            "{elapsed}"
+        );
+    }
+    let ago_cases = [
+        (10_000u64, 50_000u64),
+        (3_600_000, 3_600_000),
+        (86_400_000, 86_400_000),
+    ];
+    for (elapsed, step) in ago_cases {
+        let mut row = sample_row("PRJ", "repo", 1, "Noted", false, false, false);
+        row.updated_ms = now + 1;
+        row.events.push(bistill_lib::Event {
+            id: 1,
+            created_ms: now - elapsed,
+            actor_slug: "pat".to_owned(),
+            actor_name: "Pat".to_owned(),
+            kind: bistill_lib::EventKind::Commented,
+            text: "hi".to_owned(),
+            thread: Vec::new(),
+            added_user: false,
+        });
+        let snapshot = sample_snapshot(vec![row], Vec::new());
+        assert_eq!(
+            screen::next_age(Some(&snapshot), now),
+            Some(Duration::from_millis(step)),
+            "ago {elapsed}"
+        );
+    }
+    let mut soon = sample_row("PRJ", "repo", 1, "Soon", false, false, false);
+    soon.updated_ms = now - 90_000;
+    let mut later = sample_row("PRJ", "repo", 2, "Later", false, false, false);
+    later.updated_ms = now - 500;
+    let both = sample_snapshot(vec![soon], vec![later]);
+    assert_eq!(
+        screen::next_age(Some(&both), now),
+        Some(Duration::from_millis(500))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_file_wakes_and_cancel_ends_the_wait() {
+    use std::os::unix::ffi::OsStrExt;
+    let cwd = watch_dir("refresh-watch");
+    assert!(refresh_os::pipe_pair(-1).is_err());
+    assert!(refresh_os::notify_fd(-1).is_err());
+    assert!(refresh_os::c_path(Path::new("a\0b")).is_err());
+    assert!(refresh_os::c_path(Path::new("state")).is_ok());
+    assert!(refresh_os::bytes_read(0).is_err());
+    assert!(refresh_os::bytes_read(-1).is_err());
+    assert_eq!(refresh_os::bytes_read(4).unwrap(), 4);
+    refresh_os::close_fd(-1);
+    assert!(refresh_os::poll_pair(-1, 0).is_err());
+    assert!(refresh_os::poll_pair(0, -1).is_err());
+    assert!(refresh_os::open(Path::new("/no/such/bistill-refresh")).is_err());
+    assert!(refresh_os::open_with(&cwd, -1).is_err());
+    let (idle_r, idle_w) = refresh_os::pipe_pair(0).unwrap();
+    assert!(refresh_os::poll_for(idle_r, idle_w, 0).is_err());
+    refresh_os::close_fd(idle_r);
+    refresh_os::close_fd(idle_w);
+    let mut zero = vec![0u8; 16];
+    zero.extend(inotify_name(b"refresh"));
+    assert!(refresh_os::names_refresh(&zero));
+    assert!(refresh_os::open(Path::new("a\0b")).is_err());
+    let odd = std::ffi::OsStr::from_bytes(&[0xff]);
+    assert!(refresh_os::c_path(Path::new(odd)).is_ok());
+    assert!(!refresh_os::names_refresh(&[]));
+    assert!(!refresh_os::names_refresh(&[0; 8]));
+    let mut truncated = vec![0u8; 16];
+    truncated[12..16].copy_from_slice(&100u32.to_ne_bytes());
+    assert!(!refresh_os::names_refresh(&truncated));
+    assert!(!refresh_os::names_refresh(&inotify_name(b"other")));
+    assert!(refresh_os::names_refresh(&inotify_name(b"refresh")));
+    let mut bare = vec![0u8; 16];
+    bare[12..16].copy_from_slice(&7u32.to_ne_bytes());
+    bare.extend_from_slice(b"refresh");
+    assert!(refresh_os::names_refresh(&bare));
+    let mut both = inotify_name(b"other");
+    both.extend(inotify_name(b"refresh"));
+    assert!(refresh_os::names_refresh(&both));
+
+    let watch = refresh_os::open(&cwd).unwrap();
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| watch.wait());
+        fs::write(cwd.join("noise"), b"").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(cwd.join("refresh"), b"").unwrap();
+        assert!(waiting.join().unwrap().unwrap());
+    });
+    let watch = refresh_os::open(&cwd).unwrap();
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| watch.wait());
+        watch.cancel();
+        assert!(!waiting.join().unwrap().unwrap());
+    });
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[cfg(unix)]
+fn inotify_name(name: &[u8]) -> Vec<u8> {
+    let mut body = name.to_vec();
+    if !body.contains(&0) {
+        body.push(0);
+    }
+    let mut buf = vec![0u8; 16];
+    buf[12..16].copy_from_slice(&(body.len() as u32).to_ne_bytes());
+    buf.extend(body);
+    buf
 }
 
 #[test]
@@ -2257,9 +2816,10 @@ impl Session for Inbox {
         self.now
     }
 
-    fn pause(&mut self, _: Duration) {
+    fn pause(&mut self, _: Duration, _: &std::sync::mpsc::Receiver<Nudge>) -> Paused {
         self.now += self.jump;
         std::thread::yield_now();
+        Paused::Elapsed
     }
 
     fn again(&mut self) -> bool {
@@ -2284,6 +2844,23 @@ fn feed(steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Inbox {
 enum DriveStep {
     Until(String),
     Event(tui::Event),
+    /// Return once without an event so the draw thread can wait on an age.
+    Idle,
+}
+
+struct DrivePark(std::sync::Arc<tui::Gate>);
+
+impl tui::Park for DrivePark {
+    fn park(&self, seen: u64) -> u64 {
+        match self.0.park_for(seen, Duration::from_secs(8)) {
+            Some(generation) => generation,
+            None => panic!("stalled"),
+        }
+    }
+
+    fn unpark(&self) {
+        self.0.unpark();
+    }
 }
 
 struct Drive {
@@ -2292,6 +2869,7 @@ struct Drive {
     fetch_seen: bool,
     queue: std::collections::VecDeque<DriveStep>,
     spins: u32,
+    gate: std::sync::Arc<tui::Gate>,
 }
 
 impl Drive {
@@ -2302,6 +2880,7 @@ impl Drive {
             fetch_seen: false,
             queue: queue.into(),
             spins: 0,
+            gate: tui::Gate::new(),
         }
     }
 }
@@ -2318,6 +2897,11 @@ impl tui::Backend for Drive {
 
     fn draw(&mut self, buffer: &tui::Buffer) {
         self.grid.draw(buffer);
+        tui::Park::unpark(&*self.gate);
+    }
+
+    fn parking(&self) -> std::sync::Arc<dyn tui::Park> {
+        std::sync::Arc::new(DrivePark(self.gate.clone()))
     }
 
     fn poll(&mut self, timeout: Duration) -> Option<tui::Event> {
@@ -2338,6 +2922,10 @@ impl tui::Backend for Drive {
                     self.spins += 1;
                     assert!(self.spins < 10_000, "stalled\n{text}");
                     std::thread::yield_now();
+                    return None;
+                }
+                Some(DriveStep::Idle) => {
+                    self.queue.pop_front();
                     return None;
                 }
                 Some(DriveStep::Event(_)) => {
@@ -2371,6 +2959,24 @@ fn drive_text(grid: &tui::TestBackend) -> String {
 
 fn step_key(ch: char) -> DriveStep {
     DriveStep::Event(tui::Event::Key(tui::KeyCode::Char(ch)))
+}
+
+#[test]
+fn tui_repaints_when_an_age_changes() {
+    let cwd = watch_dir("tui-age");
+    let mut row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    row.updated_ms = crate::unix_ms(std::time::SystemTime::now()).saturating_sub(400);
+    let mut session = feed(vec![listed_ok(vec![row])]);
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        DriveStep::Idle,
+        step_key('q'),
+    ]);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
 }
 
 #[test]
@@ -2546,25 +3152,7 @@ fn tui_logs_a_watermark_that_cannot_be_written() {
 }
 
 #[test]
-fn tray_errors_are_logged_once() {
-    let mut log = String::new();
-    let mut logged = false;
-    fn ok(_: u64) -> Result<(), host::Error> {
-        Ok(())
-    }
-    crate::app::record_tray(1, &mut log, &mut logged, ok);
-    assert!(log.is_empty());
-    fn fail(_: u64) -> Result<(), host::Error> {
-        Err(host::Error::Failed {
-            program: "tray".to_owned(),
-            message: "no watcher".to_owned(),
-        })
-    }
-    crate::app::record_tray(1, &mut log, &mut logged, fail);
-    assert!(log.contains("no watcher"));
-    let len = log.len();
-    crate::app::record_tray(2, &mut log, &mut logged, fail);
-    assert_eq!(log.len(), len);
+fn ignore_skips_a_missing_row_and_marks_the_author() {
     let snapshot = sample_snapshot(
         vec![sample_row(
             "PRJ",
@@ -2883,6 +3471,7 @@ fn help_box_covers_the_inbox_and_keys_mark_or_ignore() {
     );
     let text = grid_text(&grid);
     assert!(text.contains("new "));
+    assert_eq!(find_style(&grid, "new").fg, Some(tui::Color::Green));
     assert!(text.contains("please look"));
     assert!(text.contains("pushed"));
     assert_eq!(

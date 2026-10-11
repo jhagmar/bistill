@@ -17,6 +17,9 @@ services:
       - ci-cargo-registry:/opt/cargo/registry
       - ci-cargo-git:/opt/cargo/git
       - ci-target:/src/target
+    # The bridge drops a TLS handshake when the host route is a VPN.
+    # The host network uses that route.
+    network_mode: host
     command: ["/src/ci/entrypoint.sh"]
 
   codeql:
@@ -31,6 +34,7 @@ services:
       - codeql-cargo-registry:/opt/cargo/registry
       - codeql-cargo-git:/opt/cargo/git
       - codeql-target:/tmp/cargo-target
+    network_mode: host
     command: ["/src/ci/codeql.sh"]
 
 volumes:

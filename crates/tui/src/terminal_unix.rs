@@ -8,8 +8,9 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 const TCGETS: u64 = 0x5401;
@@ -29,6 +30,9 @@ const O_RDWR: i32 = 2;
 const O_NOCTTY: i32 = 0o400;
 #[cfg(test)]
 const O_CLOEXEC: i32 = 0x80000;
+const PIPE_CLOEXEC: i32 = 0x80000;
+const O_NONBLOCK: i32 = 0o4000;
+const SIGWINCH: i32 = 28;
 
 const IGNBRK: u32 = 0x1;
 const BRKINT: u32 = 0x2;
@@ -89,6 +93,15 @@ unsafe extern "C" {
     fn unix_write(fd: i32, buf: *const u8, count: usize) -> isize;
     #[link_name = "fcntl"]
     fn unix_fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+    fn pipe2(fds: *mut i32, flags: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn signal(sig: i32, handler: unsafe extern "C" fn(i32)) -> usize;
+}
+
+#[cfg(test)]
+unsafe extern "C" {
+    fn raise(sig: i32) -> i32;
 }
 
 #[cfg(test)]
@@ -105,11 +118,23 @@ struct Armed {
 }
 
 static ARMED: Mutex<Option<Armed>> = Mutex::new(None);
+static WAKE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" fn on_winch(_sig: i32) {
+    let fd = WAKE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            unix_write(fd, &1u8, 1);
+        }
+    }
+}
 
 /// A Unix terminal claimed for raw mode.
 pub struct Console {
     input: File,
     output: File,
+    poke_r: i32,
+    poke_w: i32,
 }
 
 impl Console {
@@ -138,10 +163,24 @@ impl Console {
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         read_count(&mut self.input, buf)
     }
+
+    /// A park that blocks on this terminal and on `SIGWINCH` without the draw lock.
+    pub fn parking(&self) -> Arc<dyn crate::backend::Park> {
+        Arc::new(FdPark {
+            input: dup_raw(self.input.as_raw_fd()),
+            poke_r: dup_raw(self.poke_r),
+            poke_w: dup_raw(self.poke_w),
+        })
+    }
 }
 
 impl Drop for Console {
     fn drop(&mut self) {
+        if WAKE_WRITE.load(Ordering::Relaxed) == self.poke_w {
+            WAKE_WRITE.store(-1, Ordering::Relaxed);
+        }
+        close_fd(self.poke_r);
+        close_fd(self.poke_w);
         disarm();
     }
 }
@@ -151,13 +190,35 @@ pub(crate) fn from_files(input: File, output: File) -> io::Result<Console> {
     enable(input, output)
 }
 
-fn enable(input: File, output: File) -> io::Result<Console> {
-    let saved = get_termios(input.as_raw_fd())?;
+fn prepare_termios(fd: i32) -> io::Result<Termios> {
+    let saved = get_termios(fd)?;
     let mut raw = saved;
     make_raw(&mut raw);
-    set_termios(input.as_raw_fd(), &raw)?;
+    set_termios(fd, &raw)?;
+    Ok(saved)
+}
+
+fn enable(input: File, output: File) -> io::Result<Console> {
+    let (poke_r, poke_w) = wake_pipe()?;
+    let saved = match prepare_termios(input.as_raw_fd()) {
+        Ok(saved) => saved,
+        Err(err) => {
+            close_fd(poke_r);
+            close_fd(poke_w);
+            return Err(err);
+        }
+    };
     arm(input.as_raw_fd(), output.as_raw_fd(), saved);
-    Ok(Console { input, output })
+    WAKE_WRITE.store(poke_w, Ordering::Relaxed);
+    unsafe {
+        signal(SIGWINCH, on_winch);
+    }
+    Ok(Console {
+        input,
+        output,
+        poke_r,
+        poke_w,
+    })
 }
 
 fn make_raw(termios: &mut Termios) {
@@ -251,6 +312,98 @@ fn wait_fd(fd: i32, timeout: Duration) -> bool {
     // SAFETY: `poll_fd` is a live `pollfd` and `fd` is open.
     let ready = unsafe { unix_poll(&mut poll_fd, 1, poll_millis(timeout)) };
     ready > 0
+}
+
+struct FdPark {
+    input: i32,
+    poke_r: i32,
+    poke_w: i32,
+}
+
+impl Drop for FdPark {
+    fn drop(&mut self) {
+        close_fd(self.input);
+        close_fd(self.poke_r);
+        close_fd(self.poke_w);
+    }
+}
+
+impl crate::backend::Park for FdPark {
+    fn park(&self, _seen: u64) -> u64 {
+        wait_readable(self.input, self.poke_r);
+        drain_fd(self.poke_r);
+        0
+    }
+
+    fn unpark(&self) {
+        unsafe {
+            unix_write(self.poke_w, &1u8, 1);
+        }
+    }
+}
+
+fn wait_readable(input: i32, poke: i32) {
+    let mut fds = [
+        PollFd {
+            fd: input,
+            events: POLLIN,
+            revents: 0,
+        },
+        PollFd {
+            fd: poke,
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
+    unsafe {
+        unix_poll(fds.as_mut_ptr(), 2, -1);
+    }
+}
+
+fn drain_fd(fd: i32) {
+    let mut buf = [0u8; 32];
+    loop {
+        let n = unsafe { read(fd, buf.as_mut_ptr(), buf.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+pub(crate) fn dup_raw(fd: i32) -> i32 {
+    match dup_fd(fd) {
+        Ok(file) => file.into_raw_fd(),
+        Err(_) => -1,
+    }
+}
+
+fn wake_pipe() -> io::Result<(i32, i32)> {
+    pipe_ends(PIPE_CLOEXEC | O_NONBLOCK)
+}
+
+pub(crate) fn pipe_ends(flags: i32) -> io::Result<(i32, i32)> {
+    let mut fds = [-1, -1];
+    let rc = unsafe { pipe2(fds.as_mut_ptr(), flags) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok((fds[0], fds[1]))
+    }
+}
+
+pub(crate) fn close_fd(fd: i32) {
+    if fd >= 0 {
+        unsafe {
+            close(fd);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn raise_winch() {
+    unsafe {
+        raise(SIGWINCH);
+    }
 }
 
 pub(crate) fn read_count(file: &mut File, buf: &mut [u8]) -> usize {

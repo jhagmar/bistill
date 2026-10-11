@@ -39,6 +39,13 @@ mod curl_bin;
 #[cfg(windows)]
 #[path = "curl_windows.rs"]
 mod curl_bin;
+
+#[cfg(unix)]
+#[path = "refresh_unix.rs"]
+mod refresh_os;
+#[cfg(windows)]
+#[path = "refresh_windows.rs"]
+mod refresh_os;
 pub use app::{Exit, Prepared, drive, prepare};
 pub use args::Tui;
 pub use open_os::browser;
@@ -56,7 +63,26 @@ use bistill_lib::{
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A message that ends a poll wait early.
+pub(crate) enum Nudge {
+    /// The holder is quitting.
+    Quit,
+    /// `refresh` appeared, or this process asked for a poll.
+    Refresh,
+}
+
+/// Why [`Session::pause`] returned.
+pub(crate) enum Paused {
+    /// The requested gap elapsed.
+    Elapsed,
+    /// [`Nudge::Quit`] arrived, or the sender is gone.
+    Quit,
+    /// [`Nudge::Refresh`] arrived.
+    Refresh,
+}
 
 /// A curl version read and a ping. Tests supply a stand-in.
 pub trait Session {
@@ -77,9 +103,16 @@ pub trait Session {
     fn now_ms(&mut self) -> u64 {
         unix_ms(SystemTime::now())
     }
-    /// Wait before the next poll. The poller calls this in slices of about a second.
-    fn pause(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
+    /// Block until `duration` elapses or `wake` receives quit or refresh.
+    /// The gap between polls stays the poll floor.
+    #[allow(private_interfaces)]
+    fn pause(&mut self, duration: Duration, wake: &mpsc::Receiver<Nudge>) -> Paused {
+        match wake.recv_timeout(duration) {
+            Ok(Nudge::Quit) => Paused::Quit,
+            Ok(Nudge::Refresh) => Paused::Refresh,
+            Err(mpsc::RecvTimeoutError::Timeout) => Paused::Elapsed,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Paused::Quit,
+        }
     }
     /// `false` ends the poller. The live session keeps polling.
     fn again(&mut self) -> bool {

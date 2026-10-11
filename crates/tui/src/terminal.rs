@@ -1,24 +1,25 @@
 //! The terminal this process is attached to.
 //!
-//! [`Terminal`] switches to the alternate screen and raw mode. When it is
-//! dropped, the previous screen and console mode come back. A panic runs
-//! that restore before the stack unwinds.
+//! [`Terminal`] switches to the alternate screen, hides the cursor, and
+//! enables raw mode. When it is dropped, the previous screen, the cursor,
+//! and the console mode come back. A panic runs that restore before the
+//! stack unwinds.
 
-use crate::backend::{Backend, Event, KeyCode, MouseButton, Wheel};
+use crate::backend::{Backend, Event, KeyCode, MouseButton, Park, Wheel};
 use crate::buffer::{Buffer, Glyph};
 use crate::layout::Rect;
 use crate::style::{Color, Style};
 use crate::terminal_os;
 use std::io;
 use std::panic::{PanicHookInfo, set_hook, take_hook};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 #[cfg(all(unix, test))]
 use std::fs::File;
 
-pub(crate) const ENTER: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h";
-pub(crate) const LEAVE: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
+pub(crate) const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h";
+pub(crate) const LEAVE: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l";
 
 type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Send + Sync>;
 
@@ -98,6 +99,10 @@ impl Backend for Terminal {
         } else {
             self.next_event(timeout)
         }
+    }
+
+    fn parking(&self) -> Arc<dyn Park> {
+        self.console.parking()
     }
 }
 
