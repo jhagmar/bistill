@@ -1,9 +1,11 @@
-//! The inbox list behind `ls` and `watch`.
+//! The inbox list the terminal process polls.
 //!
 //! [`list_inbox`] reads application-properties, the user, and both inbox roles.
 //! It follows `nextPageStart`, and if a role comes back HTTP 400 it tries that
-//! role again in lowercase. The 50 oldest open pull requests get the extra
-//! detail. The rest stay in the list with the plain defaults.
+//! role again in lowercase. A pull request whose update time changed, or that
+//! this process has not fetched yet, gets its activity pages. Waiting rows also
+//! get build status and merge. A cached row keeps its events until that fetch
+//! finishes.
 
 use std::collections::HashMap;
 
@@ -100,7 +102,7 @@ pub fn list_inbox(
     now_ms: u64,
     publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
 ) -> Result<Listed, Error> {
-    poll_list(client, fetch, now_ms, publish).map_err(|fault| fault.error)
+    poll_list(client, fetch, now_ms, &[], publish).map_err(|fault| fault.error)
 }
 
 /// [`list_inbox`] plus `Retry-After` when the failing response carries it.
@@ -108,6 +110,7 @@ pub fn poll_list(
     client: &Client,
     fetch: &mut dyn Fetch,
     now_ms: u64,
+    cached: &[Row],
     publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
 ) -> Result<Listed, InboxFault> {
     let mut requests = Vec::new();
@@ -125,6 +128,7 @@ pub fn poll_list(
     for role in ["REVIEWER", "AUTHOR"] {
         role_pages(client, fetch, &mut requests, role, &mut prs, &mut |rows| {
             let mut snapshot = assemble(client, &product, &user, rows, now_ms);
+            carry(&mut snapshot, cached);
             fingerprint::stamp(&mut snapshot);
             publish(&snapshot).map_err(InboxFault::from)
         })?;
@@ -134,7 +138,8 @@ pub fn poll_list(
         snapshot: assemble(client, &product, &user, &prs, now_ms),
         requests,
     };
-    enrich_listed(client, fetch, &mut listed, &sources, publish)?;
+    carry(&mut listed.snapshot, cached);
+    enrich_listed(client, fetch, &mut listed, &sources, cached, publish)?;
     fingerprint::stamp(&mut listed.snapshot);
     publish(&listed.snapshot)?;
     Ok(listed)
@@ -230,20 +235,54 @@ fn sources_of(prs: &[PullRequest]) -> HashMap<String, Source> {
     sources
 }
 
+fn carry(snapshot: &mut Snapshot, cached: &[Row]) {
+    for row in snapshot
+        .needs_review
+        .iter_mut()
+        .chain(snapshot.waiting.iter_mut())
+    {
+        if let Some(old) = cached.iter().find(|old| old.id == row.id) {
+            row.events = old.events.clone();
+            row.events_loaded = old.events_loaded;
+            row.build = old.build;
+            row.conflicted = old.conflicted;
+            row.can_merge = old.can_merge;
+            row.unanswered_as_author = old.unanswered_as_author;
+            row.unanswered_as_reviewer = old.unanswered_as_reviewer;
+            row.open_tasks = old.open_tasks;
+        }
+    }
+}
+
+fn unchanged(cached: &[Row], row: &Row) -> bool {
+    cached
+        .iter()
+        .any(|old| old.id == row.id && old.updated_ms == row.updated_ms && old.events_loaded)
+}
+
 fn enrich_listed(
     client: &Client,
     fetch: &mut dyn Fetch,
     listed: &mut Listed,
     sources: &HashMap<String, Source>,
+    cached: &[Row],
     publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
 ) -> Result<(), InboxFault> {
     let user_slug = listed.snapshot.user_slug.clone();
     let chosen = enrich::slots(
         &listed.snapshot.needs_review,
         &listed.snapshot.waiting,
-        ENRICH_CAP,
+        usize::MAX,
     );
     for slot in chosen {
+        let row = match slot {
+            enrich::Slot::Needs(index) => &listed.snapshot.needs_review[index],
+            enrich::Slot::Waiting(index) => &listed.snapshot.waiting[index],
+        };
+        if unchanged(cached, row) {
+            continue;
+        }
+        let activities_only = matches!(slot, enrich::Slot::Needs(_));
         let (project, repo, number, source) = target(&listed.snapshot, slot, sources);
         let filled = {
             let Listed { snapshot, requests } = listed;
@@ -263,18 +302,25 @@ fn enrich_listed(
                     author_slug: &source.author_slug,
                     user_slug: &user_slug,
                     from_commit: source.from_commit.as_deref(),
+                    activities_only,
                 },
                 &mut on,
             )?
         };
         match slot {
             enrich::Slot::Needs(index) => {
-                enrich::write(&mut listed.snapshot.needs_review[index], filled);
+                let row = &mut listed.snapshot.needs_review[index];
+                row.unanswered_as_author = filled.unanswered_as_author;
+                row.unanswered_as_reviewer = filled.unanswered_as_reviewer;
+                row.events = filled.events;
+                row.events_loaded = true;
             }
             enrich::Slot::Waiting(index) => {
                 enrich::write(&mut listed.snapshot.waiting[index], filled);
             }
         }
+        fingerprint::stamp(&mut listed.snapshot);
+        publish(&listed.snapshot)?;
     }
     Ok(())
 }
@@ -330,9 +376,8 @@ pub fn to_json(snapshot: &Snapshot) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-fn truncated(sections: &Sections) -> u64 {
-    let open = sections.needs_review.len() + sections.waiting.len();
-    open.saturating_sub(ENRICH_CAP) as u64
+fn truncated(_sections: &Sections) -> u64 {
+    0
 }
 
 fn role_pages(
@@ -470,7 +515,39 @@ fn row_value(row: &Row) -> Value {
         ]);
     }
     pairs.push(("fingerprint", string(&row.fingerprint)));
+    pairs.push(("events_loaded", boolean(row.events_loaded)));
+    pairs.push((
+        "events",
+        Value::Array(row.events.iter().map(event_value).collect()),
+    ));
     object(pairs)
+}
+
+fn event_value(event: &crate::Event) -> Value {
+    object(vec![
+        ("id", number(event.id)),
+        ("created_ms", number(event.created_ms)),
+        ("actor_slug", string(&event.actor_slug)),
+        ("actor_name", string(&event.actor_name)),
+        ("kind", string(kind_text(event.kind))),
+        ("text", string(&event.text)),
+        (
+            "thread",
+            Value::Array(event.thread.iter().map(|slug| string(slug)).collect()),
+        ),
+        ("added_user", boolean(event.added_user)),
+    ])
+}
+
+fn kind_text(kind: crate::EventKind) -> &'static str {
+    match kind {
+        crate::EventKind::Commented => "commented",
+        crate::EventKind::Approved => "approved",
+        crate::EventKind::Pushed => "pushed",
+        crate::EventKind::Reopened => "reopened",
+        crate::EventKind::Added => "added",
+        crate::EventKind::Other => "other",
+    }
 }
 
 fn status_text(status: SnapshotStatus) -> &'static str {

@@ -13,8 +13,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Why a program or a GET failed.
 #[derive(Debug)]
@@ -128,22 +129,26 @@ pub fn run(program: &str, args: &[OsString], timeout: Duration) -> Result<Output
     let mut stderr = child.stderr.take().expect("piped stderr");
     let stdout_thread = thread::spawn(move || read_to_end(&mut stdout));
     let stderr_thread = thread::spawn(move || read_to_end(&mut stderr));
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait().expect("wait for child") {
-            Some(status) => break status,
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(Error::Timeout {
-                    program: program.to_owned(),
-                });
-            }
-            None => thread::sleep(Duration::from_millis(10)),
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let status = child.wait().expect("wait for child");
+        let _ = tx.send(status);
+    });
+    let status = match rx.recv_timeout(timeout) {
+        Ok(status) => status,
+        Err(_) => {
+            kill_pid(pid);
+            let _ = rx.recv();
+            let _ = waiter.join();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err(Error::Timeout {
+                program: program.to_owned(),
+            });
         }
     };
+    let _ = waiter.join();
     let stdout = stdout_thread.join().expect("stdout thread");
     let stderr = stderr_thread.join().expect("stderr thread");
     let Some(code) = status.code() else {
@@ -598,6 +603,48 @@ fn detail(program: &str, code: i32, stderr: &[u8]) -> String {
 const POWERSHELL_APP_ID: &str =
     "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
 
+fn kill_pid(pid: u32) {
+    kill_os::kill_pid(pid);
+}
+
+#[cfg(unix)]
+mod kill_os {
+    #![allow(unsafe_code)]
+
+    pub(super) fn kill_pid(pid: u32) {
+        unsafe {
+            kill(pid as i32, 9);
+        }
+    }
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+}
+
+#[cfg(windows)]
+mod kill_os {
+    #![allow(unsafe_code)]
+
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    pub(super) fn kill_pid(pid: u32) {
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if !handle.is_null() {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn TerminateProcess(handle: *mut core::ffi::c_void, code: u32) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+}
+
 fn is_tls(code: i32) -> bool {
     matches!(
         code,
@@ -613,6 +660,46 @@ fn redact(header: &str) -> String {
         format!("{}: ***", name.trim())
     } else {
         header.to_owned()
+    }
+}
+
+#[cfg(unix)]
+mod tray_unix;
+#[cfg(windows)]
+mod tray_windows;
+
+/// Tooltip for `count` unread pull requests.
+pub(crate) fn tray_tip(count: u64) -> String {
+    if count == 0 {
+        "Nothing new".to_owned()
+    } else if count == 1 {
+        "1 unread".to_owned()
+    } else {
+        format!("{count} unread")
+    }
+}
+
+/// Keep the tray icon updated until `rx` disconnects.
+///
+/// Linux holds one StatusNotifierItem on the session bus until quit and answers
+/// the watcher’s property reads. Windows calls `Shell_NotifyIcon`. The first
+/// failure is passed to `log`.
+pub fn run_tray(rx: std::sync::mpsc::Receiver<u64>, log: &mut dyn FnMut(&str)) {
+    #[cfg(unix)]
+    {
+        tray_unix::run(rx, log);
+    }
+    #[cfg(windows)]
+    {
+        let mut logged = false;
+        while let Ok(count) = rx.recv() {
+            if let Err(err) = tray_windows::set_unread(count) {
+                if !logged {
+                    logged = true;
+                    log(&format!("{err}\n"));
+                }
+            }
+        }
     }
 }
 

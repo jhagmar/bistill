@@ -358,6 +358,8 @@ fn parse_row(value: &Value, user_slug: &str, section: Section) -> Result<Row, Er
         conflicted,
         can_merge,
         fingerprint: String::new(),
+        events: parse_events(value)?,
+        events_loaded: flag_or_false(value, "events_loaded")?,
     };
     let computed = fingerprint(&row, section, user_slug);
     if stored != computed {
@@ -366,6 +368,70 @@ fn parse_row(value: &Value, user_slug: &str, section: Section) -> Result<Row, Er
     let mut row = row;
     row.fingerprint = computed;
     Ok(row)
+}
+
+fn flag_or_false(value: &Value, name: &str) -> Result<bool, Error> {
+    match value.get(name) {
+        None => Ok(false),
+        Some(field) => match field.as_bool() {
+            Some(flag) => Ok(flag),
+            None => Err(shape(&format!("{name} is not a bool"))),
+        },
+    }
+}
+
+fn parse_events(value: &Value) -> Result<Vec<crate::Event>, Error> {
+    match value.get("events") {
+        None => Ok(Vec::new()),
+        Some(field) => match field.as_array() {
+            Some(items) => items.iter().map(parse_event).collect(),
+            None => Err(shape("events is not an array")),
+        },
+    }
+}
+
+fn parse_event(value: &Value) -> Result<crate::Event, Error> {
+    if value.as_object().is_none() {
+        return Err(shape("event is not an object"));
+    }
+    Ok(crate::Event {
+        id: req_u64(value, "id")?,
+        created_ms: req_u64(value, "created_ms")?,
+        actor_slug: req_string(value, "actor_slug")?,
+        actor_name: req_string(value, "actor_name")?,
+        kind: parse_kind(&req_string(value, "kind")?)?,
+        text: req_string(value, "text")?,
+        thread: parse_thread(value)?,
+        added_user: req_bool(value, "added_user")?,
+    })
+}
+
+fn parse_thread(value: &Value) -> Result<Vec<String>, Error> {
+    match value.get("thread") {
+        Some(field) => match field.as_array() {
+            Some(items) => items
+                .iter()
+                .map(|item| match item.as_str() {
+                    Some(text) => Ok(text.to_owned()),
+                    None => Err(shape("thread slug is not a string")),
+                })
+                .collect(),
+            None => Err(shape("thread is not an array")),
+        },
+        None => Err(shape("missing thread")),
+    }
+}
+
+fn parse_kind(text: &str) -> Result<crate::EventKind, Error> {
+    match text {
+        "commented" => Ok(crate::EventKind::Commented),
+        "approved" => Ok(crate::EventKind::Approved),
+        "pushed" => Ok(crate::EventKind::Pushed),
+        "reopened" => Ok(crate::EventKind::Reopened),
+        "added" => Ok(crate::EventKind::Added),
+        "other" => Ok(crate::EventKind::Other),
+        _ => Err(shape("unknown event kind")),
+    }
 }
 
 fn parse_reviewers(value: &Value) -> Result<Vec<Reviewer>, Error> {

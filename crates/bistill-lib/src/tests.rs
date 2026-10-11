@@ -561,6 +561,10 @@ fn fixtures_parse_without_network() {
     assert!(matches!(partial, InboxCount::Total(4)));
     let zero = parse_inbox(br#"{"count":0}"#).unwrap();
     assert!(matches!(zero, InboxCount::Total(0)));
+    let open = parse_inbox(br#"{"OPEN":4}"#).unwrap();
+    assert!(matches!(open, InboxCount::Total(4)));
+    let count_wins = parse_inbox(br#"{"count":2,"OPEN":9}"#).unwrap();
+    assert!(matches!(count_wins, InboxCount::Total(2)));
     let _ = format!("{product:?} {user:?} {split:?} {total:?} {both:?} {partial:?} {zero:?}");
 }
 
@@ -795,6 +799,7 @@ fn inbox_fixtures_split_into_the_two_sections() {
     assert_eq!(
         needs,
         [
+            "Already approved",
             "Draft the pipe",
             "Quiet draft",
             "Fix the pipe",
@@ -807,19 +812,24 @@ fn inbox_fixtures_split_into_the_two_sections() {
             .iter()
             .all(|row| !row.stale && !row.needs_work)
     );
-    assert!(sections.needs_review[0].draft);
+    assert!(!sections.needs_review[0].draft);
     assert_eq!(
-        sections.needs_review[0].html_url,
-        "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/13"
+        sections.needs_review[0].reviewers[0].status,
+        ReviewStatus::Approved
     );
     assert!(sections.needs_review[1].draft);
     assert_eq!(
-        sections.needs_review[1].reviewers[0].status,
+        sections.needs_review[1].html_url,
+        "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/13"
+    );
+    assert!(sections.needs_review[2].draft);
+    assert_eq!(
+        sections.needs_review[2].reviewers[0].status,
         ReviewStatus::NeedsWork
     );
-    assert!(!sections.needs_review[2].draft);
+    assert!(!sections.needs_review[3].draft);
     assert_eq!(
-        sections.needs_review[2].html_url,
+        sections.needs_review[3].html_url,
         "https://git.example.invalid/projects/PRJ/repos/repo/pull-requests/12"
     );
     let waiting: Vec<_> = sections.waiting.iter().map(|row| row.id.as_str()).collect();
@@ -849,7 +859,7 @@ fn inbox_fixtures_split_into_the_two_sections() {
             .needs_review
             .iter()
             .chain(sections.waiting.iter())
-            .all(|row| row.title != "Already declined" && row.title != "Already approved")
+            .all(|row| row.title != "Already declined")
     );
     let _ = format!("{sections:?}");
 }
@@ -900,6 +910,18 @@ fn classify_drops_duplicates_and_bounds_stale() {
         sections.waiting[0].html_url,
         "https://git.example.invalid/projects/PRJ/repos/a%2Fb/pull-requests/2"
     );
+    let other = authored(3, "Other", "repo", "PRJ", NOW_MS, r#""draft":false"#)
+        .replace(r#""slug":"jcitizen""#, r#""slug":"other""#);
+    let page = parse_page(page_body(&other, "true", None).as_bytes()).unwrap();
+    let sections = classify(
+        &page.values,
+        "jcitizen",
+        "https://git.example.invalid",
+        NOW_MS,
+        7,
+    );
+    assert!(sections.needs_review.is_empty());
+    assert!(sections.waiting.is_empty());
 }
 
 #[test]
@@ -1023,10 +1045,18 @@ fn page_body(values: &str, last: &str, next: Option<u64>) -> String {
 
 const EMPTY_PAGE: &str = r#"{"size":0,"isLastPage":true,"values":[]}"#;
 
-fn quiet_enrich(rows: usize) -> Vec<Result<host::Response, host::Error>> {
+fn quiet_activity(rows: usize) -> Vec<Result<host::Response, host::Error>> {
     let mut steps = Vec::new();
     for _ in 0..rows {
-        steps.push(step(200, r#"{"size":0,"isLastPage":true,"values":[]}"#));
+        steps.push(step(200, EMPTY_PAGE));
+    }
+    steps
+}
+
+fn quiet_author(rows: usize) -> Vec<Result<host::Response, host::Error>> {
+    let mut steps = Vec::new();
+    for _ in 0..rows {
+        steps.push(step(200, EMPTY_PAGE));
         steps.push(step(200, r#"{"count":0}"#));
         steps.push(step(200, r#"{"conflicted":false,"canMerge":false}"#));
     }
@@ -1054,7 +1084,8 @@ fn list_inbox_pages_both_roles_and_round_trips() {
         step(200, EMPTY_PAGE),
         step(200, AUTHOR_PAGE),
     ];
-    steps.extend(quiet_enrich(6));
+    steps.extend(quiet_activity(5));
+    steps.extend(quiet_author(2));
     let (listed, urls) = run_list(steps);
     let mut listed = listed.unwrap();
     assert!(urls.iter().any(|url| {
@@ -1071,7 +1102,13 @@ fn list_inbox_pages_both_roles_and_round_trips() {
         .collect();
     assert_eq!(
         needs,
-        ["PRJ/repo/13", "PRJ/repo/14", "PRJ/repo/12", "PRJ/repo/22"]
+        [
+            "PRJ/repo/17",
+            "PRJ/repo/13",
+            "PRJ/repo/14",
+            "PRJ/repo/12",
+            "PRJ/repo/22"
+        ]
     );
     let waiting: Vec<_> = listed
         .snapshot
@@ -1084,14 +1121,14 @@ fn list_inbox_pages_both_roles_and_round_trips() {
     assert_eq!(listed.snapshot.poll_seconds, 60);
     assert_eq!(listed.snapshot.user_name, "Jane Citizen");
     assert_eq!(listed.snapshot.bitbucket_version, "8.19.0");
-    assert_eq!(attention_count(&listed.snapshot), 4);
-    listed.snapshot.needs_review[0].open_tasks = 9;
-    assert_eq!(attention_count(&listed.snapshot), 4);
-    listed.snapshot.waiting[0].open_tasks = 1;
     assert_eq!(attention_count(&listed.snapshot), 5);
+    listed.snapshot.needs_review[0].open_tasks = 9;
+    assert_eq!(attention_count(&listed.snapshot), 5);
+    listed.snapshot.waiting[0].open_tasks = 1;
+    assert_eq!(attention_count(&listed.snapshot), 6);
     listed.snapshot.waiting[0].open_tasks = 0;
     listed.snapshot.waiting[0].unanswered_as_author = 2;
-    assert_eq!(attention_count(&listed.snapshot), 5);
+    assert_eq!(attention_count(&listed.snapshot), 6);
     let text = to_json(&listed.snapshot);
     let parsed = json::parse(text.as_bytes()).unwrap();
     assert_eq!(json::to_vec(&parsed), text.as_bytes());
@@ -1145,19 +1182,19 @@ fn list_inbox_retries_lowercase_and_records_the_cap() {
         step(200, &page),
         step(200, EMPTY_PAGE),
     ];
-    steps.extend(quiet_enrich(50));
+    steps.extend(quiet_activity(51));
     let (capped, urls) = run_list(steps);
     let capped = capped.unwrap();
     assert_eq!(capped.snapshot.needs_review.len(), 51);
-    assert_eq!(capped.snapshot.truncated, 1);
+    assert_eq!(capped.snapshot.truncated, 0);
     assert!(capped.snapshot.waiting.is_empty());
     assert_eq!(
         urls.iter()
             .filter(|url| url.contains("/activities"))
             .count(),
-        50
+        51
     );
-    assert!(urls.iter().all(|url| !url.contains("/pull-requests/51/")));
+    assert!(urls.iter().any(|url| url.contains("/pull-requests/51/")));
 }
 
 #[test]
@@ -1236,6 +1273,8 @@ fn finger_row(id: &str, updated: u64, reviewers: Vec<Reviewer>) -> Row {
         conflicted: false,
         can_merge: false,
         fingerprint: String::new(),
+        events: Vec::new(),
+        events_loaded: false,
     }
 }
 
@@ -1845,7 +1884,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![delayed],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
+    let err = match poll_list(&client, &mut queue, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1861,7 +1900,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![open],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
+    let err = match poll_list(&client, &mut queue, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1871,7 +1910,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![step(500, "")],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
+    let err = match poll_list(&client, &mut queue, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("500"),
     };
@@ -1887,7 +1926,7 @@ fn poll_list_keeps_retry_after_on_429() {
         steps: vec![huge],
         urls: Vec::new(),
     };
-    let err = match poll_list(&client, &mut queue, 1, &mut |_| Ok(())) {
+    let err = match poll_list(&client, &mut queue, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("429"),
     };
@@ -1935,6 +1974,7 @@ fn scripted(
                 author_slug: "pat",
                 user_slug: "jcitizen",
                 from_commit: commit,
+                activities_only: false,
             },
             &mut |_| Ok(()),
         )
@@ -1948,8 +1988,8 @@ fn fault_text(err: InboxFault) -> String {
 
 #[test]
 fn list_enriches_threads_tasks_build_and_merge() {
-    let reviewer = page_body(&listed_pr(1, "pat", true, Some("abc")), "true", None);
-    let author = page_body(&listed_pr(2, "jcitizen", false, None), "true", None);
+    let reviewer = page_body(&listed_pr(1, "pat", true, None), "true", None);
+    let author = page_body(&listed_pr(2, "jcitizen", false, Some("abc")), "true", None);
     let waiting_thread = r#"{"size":1,"isLastPage":true,"values":[{"action":"COMMENTED","comment":{"createdDate":1,"author":{"slug":"sam"},"comments":[]}}]}"#;
     let (listed, urls) = run_list(vec![
         step(200, APP),
@@ -1957,28 +1997,25 @@ fn list_enriches_threads_tasks_build_and_merge() {
         step(200, &reviewer),
         step(200, &author),
         step(200, ACTIVITIES),
-        step(200, r#"{"count":4}"#),
-        step(200, BUILD_MIXED),
-        step(200, r#"{"conflicted":true,"canMerge":false}"#),
         step(200, waiting_thread),
         step(200, r#"{"count":2}"#),
-        step(200, "{}"),
+        step(200, BUILD_MIXED),
+        step(200, r#"{"conflicted":true,"canMerge":false}"#),
     ]);
     let listed = listed.unwrap();
     let _ = listed.snapshot.clone();
     let row = &listed.snapshot.needs_review[0];
     assert_eq!(row.unanswered_as_author, 5);
     assert_eq!(row.unanswered_as_reviewer, 1);
-    assert_eq!(row.open_tasks, 4);
-    assert_eq!(row.build, Build::Failed);
-    assert!(row.conflicted);
-    assert!(!row.can_merge);
+    assert!(row.events_loaded);
+    assert!(!row.events.is_empty());
+    assert_eq!(row.build, Build::None);
     let waiting = &listed.snapshot.waiting[0];
     assert_eq!(waiting.unanswered_as_author, 1);
     assert_eq!(waiting.unanswered_as_reviewer, 0);
     assert_eq!(waiting.open_tasks, 2);
-    assert_eq!(waiting.build, Build::None);
-    assert!(!waiting.conflicted);
+    assert_eq!(waiting.build, Build::Failed);
+    assert!(waiting.conflicted);
     assert!(!waiting.can_merge);
     assert_eq!(attention_count(&listed.snapshot), 2);
     assert!(urls.iter().any(|url| url.contains("/commits/abc")));
@@ -1991,8 +2028,8 @@ fn list_enriches_threads_tasks_build_and_merge() {
     let mut previous = parse_snapshot(bytes.as_bytes()).unwrap();
     previous.needs_review[0].unanswered_as_author = 0;
     previous.needs_review[0].unanswered_as_reviewer = 0;
-    previous.needs_review[0].open_tasks = 0;
-    previous.needs_review[0].build = Build::None;
+    previous.waiting[0].open_tasks = 0;
+    previous.waiting[0].build = Build::None;
     let changes = diff(Some(&previous), &current);
     let reasons = &changes
         .iter()
@@ -2000,8 +2037,13 @@ fn list_enriches_threads_tasks_build_and_merge() {
         .unwrap()
         .reasons;
     assert!(reasons.contains(&Reason::Unanswered));
-    assert!(reasons.contains(&Reason::Tasks));
-    assert!(reasons.contains(&Reason::BuildFailed));
+    let waiting_reasons = &changes
+        .iter()
+        .find(|change| change.id == "PRJ/repo/2")
+        .unwrap()
+        .reasons;
+    assert!(waiting_reasons.contains(&Reason::Tasks));
+    assert!(waiting_reasons.contains(&Reason::BuildFailed));
     let bad = parse_page(
         br#"{"size":1,"isLastPage":true,"values":[{"id":1,"title":"T","state":"OPEN","createdDate":1,"updatedDate":1,"fromRef":{"displayId":"f","latestCommit":1,"repository":{"slug":"repo","project":{"key":"PRJ"}}},"toRef":{"displayId":"main"},"author":{"user":{"displayName":"Pat","slug":"pat"}}}]}"#,
     );
@@ -2284,7 +2326,7 @@ fn poll_publishes_each_reply_and_stops_when_publish_fails() {
         ],
         urls: Vec::new(),
     };
-    let counted = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+    let counted = poll_list(&client, &mut queue, NOW_MS, &[], &mut |_| {
         seen += 1;
         Ok(())
     });
@@ -2294,7 +2336,7 @@ fn poll_publishes_each_reply_and_stops_when_publish_fails() {
         steps: vec![step(200, APP), step(200, USER_JSON), step(200, EMPTY_PAGE)],
         urls: Vec::new(),
     };
-    let err = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+    let err = poll_list(&client, &mut queue, NOW_MS, &[], &mut |_| {
         Err(Error::Io(std::io::Error::other("disk")))
     });
     let Err(err) = err else { panic!("disk") };
@@ -2311,7 +2353,7 @@ fn poll_publishes_each_reply_and_stops_when_publish_fails() {
         ],
         urls: Vec::new(),
     };
-    let err = poll_list(&client, &mut queue, NOW_MS, &mut |_| {
+    let err = poll_list(&client, &mut queue, NOW_MS, &[], &mut |_| {
         calls += 1;
         if calls == 3 {
             Err(Error::Io(std::io::Error::other("disk")))
@@ -2335,6 +2377,7 @@ fn poll_publishes_each_reply_and_stops_when_publish_fails() {
             author_slug: "pat",
             user_slug: "jcitizen",
             from_commit: None,
+            activities_only: false,
         },
         &mut |_| Err(InboxFault::from(Error::Io(std::io::Error::other("stop")))),
     );
@@ -2400,4 +2443,317 @@ fn clarify_gone_reads_merged_or_declined() {
     };
     clarify_gone(&client, &mut queue, &mut [gone]);
     assert!(queue.urls[0].contains("/projects/~me/repos/repo/pull-requests/3"));
+}
+
+fn sample_event(id: u64, actor: &str, kind: EventKind, text: &str) -> Event {
+    Event {
+        id,
+        created_ms: id,
+        actor_slug: actor.to_owned(),
+        actor_name: actor.to_owned(),
+        kind,
+        text: text.to_owned(),
+        thread: vec![actor.to_owned()],
+        added_user: kind == EventKind::Added,
+    }
+}
+
+#[test]
+fn activities_and_watermarks_follow_the_inbox_rules() {
+    let page = json::parse(
+        br#"{"values":[
+            {"action":"COMMENTED","createdDate":5,"user":{"slug":"ada","displayName":"Ada"},"comment":{"text":"see @Jcitizen","author":{"slug":"ada"},"comments":[{"author":{"slug":"jcitizen"},"text":"ok"}]}},
+            {"id":9,"action":"APPROVED","user":{"slug":"sam","displayName":"Sam"}},
+            {"id":8,"action":"UPDATED","user":{"slug":"ada","displayName":"Ada"}},
+            {"id":7,"action":"REOPENED","user":{"slug":"ada","displayName":"Ada"}},
+            {"id":6,"action":"UPDATED","addedReviewers":[{"slug":"jcitizen"},{"user":{"slug":"bea"}},{}],"user":{"slug":"ada","displayName":"Ada"}},
+            {"action":"OPENED","createdDate":4},
+            1
+        ]}"#,
+    )
+    .unwrap();
+    let err = crate::activity::page_events(&page, "jcitizen").unwrap_err();
+    assert!(err.to_string().contains("activity is not an object"));
+    let missing =
+        crate::activity::page_events(&json::parse(b"{}").unwrap(), "jcitizen").unwrap_err();
+    assert!(missing.to_string().contains("missing values"));
+    let bad = crate::activity::page_events(&json::parse(br#"{"values":1}"#).unwrap(), "jcitizen")
+        .unwrap_err();
+    assert!(bad.to_string().contains("values is not an array"));
+    let mut body = page;
+    if let json::Value::Object(pairs) = &mut body {
+        pairs[0].1 = json::parse(
+            br#"[{"action":"COMMENTED","createdDate":5,"user":{"slug":"ada","displayName":"Ada"},"comment":{"text":"see @Jcitizen","author":{"slug":"ada"},"comments":[{"author":{"slug":"jcitizen"}}]}},{"id":9,"action":"APPROVED","user":{"slug":"sam","displayName":"Sam"}},{"id":8,"action":"UPDATED","user":{"slug":"ada"}},{"id":7,"action":"REOPENED","user":{"slug":"ada","displayName":"Ada"}},{"id":6,"action":"UPDATED","addedReviewers":[{"slug":"jcitizen"},{"user":{"slug":"bea"}},{}],"user":{"slug":"ada","displayName":"Ada"}},{"action":"OPENED","createdDate":4}]"#,
+        )
+        .unwrap();
+    }
+    let events = crate::activity::page_events(&body, "jcitizen").unwrap();
+    assert_eq!(events.len(), 6);
+    assert_eq!(events[0].kind, EventKind::Commented);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::Added && event.added_user)
+    );
+    assert!(events.iter().any(|event| event.kind == EventKind::Other));
+    assert!(events.iter().any(|event| event.id == 4));
+    for event in &events {
+        let _ = format!("{event:?} {:?}", event.kind);
+    }
+
+    let dir = temp("marks");
+    assert!(read_store(&dir).unwrap().marks.is_empty());
+    let mut row = finger_row("PRJ/repo/1", 10, Vec::new());
+    row.events = vec![
+        sample_event(1, "ada", EventKind::Commented, "hello"),
+        sample_event(2, "ada", EventKind::Commented, "ping @jcitizen"),
+        sample_event(3, "jcitizen", EventKind::Commented, "mine"),
+        sample_event(4, "ada", EventKind::Approved, ""),
+        sample_event(5, "ada", EventKind::Pushed, "subject"),
+        sample_event(6, "ada", EventKind::Reopened, ""),
+        sample_event(7, "ada", EventKind::Added, ""),
+        sample_event(8, "ada", EventKind::Other, ""),
+    ];
+    row.events[1].thread = vec!["ada".to_owned(), "jcitizen".to_owned()];
+    let mut waiting = finger_row("PRJ/repo/2", 10, Vec::new());
+    waiting.events = vec![
+        sample_event(3, "sam", EventKind::Commented, "look"),
+        sample_event(4, "sam", EventKind::Approved, ""),
+        sample_event(5, "sam", EventKind::Pushed, "nope"),
+    ];
+    waiting.build = Build::Failed;
+    waiting.conflicted = true;
+    let mut snapshot = finger_snapshot("jcitizen", vec![row], vec![waiting]);
+    let encoded = to_json(&snapshot);
+    assert!(encoded.contains("\"kind\":\"approved\""));
+    assert!(encoded.contains("\"kind\":\"pushed\""));
+    assert!(encoded.contains("\"kind\":\"reopened\""));
+    assert!(encoded.contains("\"kind\":\"added\""));
+    let snap_dir = temp("event-json");
+    let reject = |body: String, needle: &str| {
+        fs::write(snap_dir.join("snapshot.json"), body).unwrap();
+        let err = read_snapshot(&snap_dir).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+    };
+    fs::write(
+        snap_dir.join("snapshot.json"),
+        encoded.replace("\"events\":", "\"events_gone\":"),
+    )
+    .unwrap();
+    assert!(read_snapshot(&snap_dir).unwrap().is_some());
+    fs::write(
+        snap_dir.join("snapshot.json"),
+        encoded.replace("\"events_loaded\":false,", ""),
+    )
+    .unwrap();
+    assert!(read_snapshot(&snap_dir).unwrap().is_some());
+    reject(
+        encoded.replace("\"events\":[", "\"events\":false,\"kept\":["),
+        "not an array",
+    );
+    reject(
+        encoded.replace("\"events_loaded\":false", "\"events_loaded\":1"),
+        "not a bool",
+    );
+    reject(
+        encoded.replace("\"events\":[", "\"events\":[1,"),
+        "not an object",
+    );
+    reject(
+        encoded.replace("\"thread\":[\"ada\"]", "\"thread\":[1]"),
+        "not a string",
+    );
+    reject(
+        encoded.replace("\"thread\":[\"ada\"]", "\"thread\":1"),
+        "not an array",
+    );
+    reject(
+        encoded.replace("\"thread\":[\"ada\"],", ""),
+        "missing thread",
+    );
+    reject(
+        encoded.replace("\"kind\":\"commented\"", "\"kind\":\"nope\""),
+        "unknown event kind",
+    );
+    fs::remove_dir_all(&snap_dir).unwrap();
+    let mut store = Store::default();
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    assert!(caught_up(&store, "PRJ/repo/1").is_none());
+    prime(&mut store, &snapshot);
+    assert_eq!(caught_up(&store, "PRJ/repo/1"), Some(8));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    prime(&mut store, &snapshot);
+    snapshot.needs_review[0].events.push(sample_event(
+        9,
+        "bea",
+        EventKind::Commented,
+        "no mention",
+    ));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.needs_review[0].events.push(sample_event(
+        10,
+        "bea",
+        EventKind::Commented,
+        "hey @Jcitizen",
+    ));
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0]
+        .events
+        .push(sample_event(11, "bea", EventKind::Pushed, ""));
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0]
+        .events
+        .push(sample_event(12, "bea", EventKind::Reopened, ""));
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0]
+        .events
+        .push(sample_event(13, "bea", EventKind::Added, ""));
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    snapshot.needs_review[0].events.pop();
+    let mut quiet = sample_event(14, "bea", EventKind::Added, "");
+    quiet.added_user = false;
+    snapshot.needs_review[0].events.push(quiet);
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.needs_review[0].events.pop();
+    let mut threaded = sample_event(15, "bea", EventKind::Commented, "in the thread");
+    threaded.thread = vec!["jcitizen".to_owned(), "bea".to_owned()];
+    snapshot.needs_review[0].events.push(sample_event(
+        16,
+        "jcitizen",
+        EventKind::Commented,
+        "self",
+    ));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0]
+        .events
+        .push(sample_event(17, "bea", EventKind::Approved, ""));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0]
+        .events
+        .push(sample_event(18, "bea", EventKind::Other, ""));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.needs_review[0].events.pop();
+    snapshot.needs_review[0].events.push(threaded);
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    assert!(toggle_ignore(&mut store, &snapshot.needs_review[0], true));
+    assert!(is_ignored(&store, "PRJ/repo/1"));
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    assert!(toggle_ignore(&mut store, &snapshot.needs_review[0], true));
+    assert!(!toggle_ignore(&mut store, &snapshot.waiting[0], false));
+    snapshot.waiting[0]
+        .events
+        .push(sample_event(6, "sam", EventKind::Commented, "more"));
+    assert_eq!(unread_count(&store, &snapshot), 2);
+    mark_read(&mut store, &snapshot.needs_review[0]);
+    mark_read(&mut store, &snapshot.waiting[0]);
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    snapshot.waiting[0].build = Build::Successful;
+    prime(&mut store, &snapshot);
+    snapshot.waiting[0].build = Build::Failed;
+    snapshot.waiting[0].conflicted = false;
+    prime(&mut store, &snapshot);
+    snapshot.waiting[0].conflicted = true;
+    assert_eq!(unread_count(&store, &snapshot), 1);
+    mark_read(&mut store, &snapshot.waiting[0]);
+    assert_eq!(unread_count(&store, &snapshot), 0);
+    write_store(&dir, &store).unwrap();
+    let loaded = read_store(&dir).unwrap();
+    assert_eq!(loaded.marks.len(), store.marks.len());
+    let _ = format!("{store:?} {:?}", store.marks.values().next().unwrap());
+    fs::write(dir.join("watermarks.json"), b"{").unwrap();
+    assert!(matches!(read_store(&dir).unwrap_err(), Error::Json(_)));
+    fs::write(dir.join("watermarks.json"), b"[]").unwrap();
+    assert!(read_store(&dir).unwrap_err().to_string().contains("object"));
+    fs::write(dir.join("watermarks.json"), b"{}").unwrap();
+    assert!(
+        read_store(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("missing items")
+    );
+    fs::write(dir.join("watermarks.json"), br#"{"items":1}"#).unwrap();
+    assert!(
+        read_store(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("not an array")
+    );
+    fs::write(dir.join("watermarks.json"), br#"{"items":[{"id":"a"}]}"#).unwrap();
+    assert!(
+        read_store(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("missing activity_id")
+    );
+    fs::write(
+        dir.join("watermarks.json"),
+        br#"{"items":[{"id":"a","activity_id":1}]}"#,
+    )
+    .unwrap();
+    assert!(
+        read_store(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("missing ignored")
+    );
+    fs::write(dir.join("watermarks.json"), br#"{"items":[{}]}"#).unwrap();
+    assert!(
+        read_store(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("missing id")
+    );
+    let file = dir.join("not-a-dir");
+    fs::write(&file, b"x").unwrap();
+    assert!(write_store(&file, &store).is_err());
+    fs::remove_file(dir.join("watermarks.json")).unwrap();
+    fs::create_dir(dir.join("watermarks.json")).unwrap();
+    assert!(matches!(read_store(&dir).unwrap_err(), Error::Io(_)));
+    fs::remove_dir_all(&dir).unwrap();
+
+    let reviewer = page_body(&listed_pr(1, "pat", true, None), "true", None);
+    let mut cached = finger_row("PRJ/repo/1", 1, Vec::new());
+    cached.events = vec![sample_event(4, "ada", EventKind::Commented, "kept")];
+    cached.events_loaded = true;
+    cached.build = Build::Successful;
+    let client = ping_client("https://git.example.invalid", "jcitizen");
+    let mut queue = Queue {
+        steps: vec![
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, &reviewer),
+            step(200, EMPTY_PAGE),
+        ],
+        urls: Vec::new(),
+    };
+    let kept = poll_list(&client, &mut queue, NOW_MS, &[cached], &mut |_| Ok(())).unwrap();
+    assert!(queue.urls.iter().all(|url| !url.contains("/activities")));
+    assert_eq!(kept.snapshot.needs_review[0].events[0].text, "kept");
+    assert_eq!(kept.snapshot.needs_review[0].build, Build::Successful);
+    let moved = page_body(
+        &listed_pr(1, "pat", true, None).replace("\"updatedDate\":1", "\"updatedDate\":9"),
+        "true",
+        None,
+    );
+    let mut queue = Queue {
+        steps: vec![
+            step(200, APP),
+            step(200, USER_JSON),
+            step(200, &moved),
+            step(200, EMPTY_PAGE),
+            step(200, EMPTY_PAGE),
+        ],
+        urls: Vec::new(),
+    };
+    let mut stale = finger_row("PRJ/repo/1", 1, Vec::new());
+    stale.events_loaded = true;
+    stale.events = vec![sample_event(1, "ada", EventKind::Commented, "old")];
+    let fresh = poll_list(&client, &mut queue, NOW_MS, &[stale], &mut |_| Ok(())).unwrap();
+    assert!(fresh.snapshot.needs_review[0].events.is_empty());
+    assert!(fresh.snapshot.needs_review[0].events_loaded);
 }

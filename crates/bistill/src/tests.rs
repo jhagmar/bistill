@@ -1,5 +1,5 @@
 use super::*;
-use bistill_lib::{Bodies, CurlFault, InboxCount, JsonError, Product, User};
+use bistill_lib::{Bodies, CurlFault, InboxCount, JsonError, Listed, Product, Row, User};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -63,8 +63,6 @@ struct Script {
     report: Option<Result<Report, Error>>,
     listed: Option<Result<Listed, Error>>,
     origin: String,
-    toasts: Vec<host::Toast>,
-    fail_notify: bool,
 }
 
 impl Session for Script {
@@ -78,37 +76,21 @@ impl Session for Script {
         self.report.take().expect("ping")
     }
 
-    fn list(
-        &mut self,
-        client: &Client,
-        now_ms: u64,
-        publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        let _ = now_ms;
-        self.origin = client.requests()[0].url.clone();
-        let listed = self.listed.take().expect("list")?;
-        publish(&listed.snapshot)?;
-        Ok(listed)
-    }
-
-    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
-        self.toasts.push(toast.clone());
-        if self.fail_notify {
-            Err(host::Error::Missing {
-                program: super::notify_bin::PROGRAM.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     fn poll(
         &mut self,
         client: &Client,
         now_ms: u64,
+        _cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
-        self.list(client, now_ms, publish)
+        let _ = now_ms;
+        self.origin = client.requests()[0].url.clone();
+        let listed = self.listed.take().expect("list");
+        listed
+            .and_then(|listed| {
+                publish(&listed.snapshot)?;
+                Ok(listed)
+            })
             .map_err(|error| bistill_lib::InboxFault {
                 error,
                 retry_after_ms: None,
@@ -142,8 +124,6 @@ fn ready(report: Result<Report, Error>) -> Script {
         report: Some(report),
         listed: None,
         origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
     }
 }
 
@@ -153,11 +133,10 @@ fn help_lists_ping_options() {
     let (code, stdout, stderr, _) = run(&["--help"], &cwd, &env_token(), ready(Ok(report())));
     assert_eq!(code, 0);
     assert!(stdout.contains("bistill ping"));
-    assert!(stdout.contains("bistill ls"));
+    assert!(stdout.contains("bistill tui"));
     assert!(stdout.contains("--json"));
-    assert!(stdout.contains("--count"));
     assert!(stdout.contains("--verbose"));
-    assert!(stdout.contains("bistill watch"));
+    assert!(!stdout.contains("bistill watch"));
     assert!(!stdout.contains("The Bitbucket list you were missing."));
     assert!(stderr.is_empty());
     let (again, text, _, _) = run(&["-h"], &cwd, &env_token(), ready(Ok(report())));
@@ -181,7 +160,7 @@ fn usage_names_the_next_step() {
     let (code, stdout, stderr, _) = run(&[], &cwd, &env, ready(Ok(report())));
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("Run ping, ls, or watch."));
+    assert!(stderr.contains("Run ping, or start the inbox"));
     assert!(stderr.contains("Usage: bistill ping"));
     let (_, _, unknown, _) = run(&["serve"], &cwd, &env, ready(Ok(report())));
     assert!(unknown.contains("Unknown argument."));
@@ -421,8 +400,6 @@ fn ready_version(err: Result<String, Error>) -> Script {
         report: None,
         listed: None,
         origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
     }
 }
 
@@ -578,17 +555,6 @@ fn ping_through_curl_reads_a_local_server() {
     fs::remove_dir_all(&cwd).unwrap();
 }
 
-fn listed_script(listed: Result<Listed, Error>) -> Script {
-    Script {
-        version: None,
-        report: None,
-        listed: Some(listed),
-        origin: String::new(),
-        toasts: Vec::new(),
-        fail_notify: false,
-    }
-}
-
 fn sample_row(
     project: &str,
     repo: &str,
@@ -622,6 +588,8 @@ fn sample_row(
         conflicted: false,
         can_merge: false,
         fingerprint: String::new(),
+        events: Vec::new(),
+        events_loaded: false,
     }
 }
 
@@ -644,64 +612,19 @@ fn sample_snapshot(needs_review: Vec<Row>, waiting: Vec<Row>) -> Snapshot {
 }
 
 #[test]
-fn ls_prints_sections_count_and_json() {
+fn ls_and_watch_are_unknown_commands() {
     let cwd = temp("ls");
     let env = env_token();
-    let snapshot = || {
-        sample_snapshot(
-            vec![
-                sample_row("PRJ", "repo", 13, "Draft the pipe", true, false, false),
-                sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false),
-            ],
-            vec![
-                sample_row("PRJ", "pipe", 21, "Waiting on Sam", false, true, true),
-                sample_row("~jcitizen", "mine", 3, "Personal repo", false, false, false),
-            ],
-        )
-    };
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(code, 0);
-    assert!(stderr.is_empty());
-    assert!(stdout.contains("Needs review\n"));
-    assert!(stdout.contains("Waiting on others\n"));
-    assert!(stdout.contains("PRJ/repo#13  Draft the pipe  draft\n"));
-    assert!(stdout.contains("PRJ/repo#12  Fix the pipe\n"));
-    assert!(stdout.contains("PRJ/pipe#21  Waiting on Sam  stale  needs work\n"));
-    assert!(stdout.contains("~jcitizen/mine#3  Personal repo\n"));
-    let (count_code, count, _, _) = run(
-        &["ls", "--count", "--json"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(count_code, 0);
-    assert_eq!(count, "2\n");
-    let (json_code, json, _, _) = run(
-        &["ls", "--json"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: snapshot(),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(json_code, 0);
-    assert!(json.contains("\"id\":\"PRJ/repo/13\""));
-    assert!(json.ends_with('\n'));
-    let disk = fs::read_to_string(cwd.join("snapshot.json")).unwrap();
-    assert!(disk.contains("PRJ/repo/13"));
-    assert!(disk.contains("fingerprint"));
+    let (code, stdout, stderr, _) = run(&["ls"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(code, 1);
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("Unknown argument."));
+    let (watch_code, _, watch_err, _) = run(&["watch"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(watch_code, 1);
+    assert!(watch_err.contains("Unknown argument."));
+    let (tui_code, _, tui_err, _) = run(&["tui"], &cwd, &env, ready(Ok(report())));
+    assert_eq!(tui_code, 1);
+    assert!(tui_err.contains("Open a terminal"));
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -715,17 +638,9 @@ fn ls_refuses_a_file_as_state_dir() {
         format!("state_dir = {}\n", file.display()),
     )
     .unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     assert_eq!(code, 1, "{stderr}");
-    assert!(stdout.is_empty());
     assert!(!stderr.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
@@ -743,68 +658,81 @@ fn ls_refuses_a_read_only_state_dir() {
     )
     .unwrap();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
-    assert!(stdout.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 
 #[test]
-fn ls_empty_is_success_and_verbose_redacts() {
-    let cwd = temp("ls-empty");
-    let env = env_token();
-    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
+fn tui_request_reads_the_bare_command_and_the_subcommand() {
+    let bare = match tui_request(&args(&[])) {
+        Some(Ok(tui)) => tui,
+        _ => panic!("bare"),
+    };
+    assert!(!bare.verbose);
+    let tui = match tui_request(&args(&[
+        "tui",
+        "--verbose",
+        "--url",
+        "https://git.example.invalid",
+    ])) {
+        Some(Ok(tui)) => tui,
+        _ => panic!("tui"),
+    };
+    assert!(tui.verbose);
+    assert_eq!(
+        tui.flags.base_url.as_deref(),
+        Some("https://git.example.invalid")
+    );
+    let err = match tui_request(&args(&["tui", "--nope"])) {
+        Some(Err(err)) => err,
+        Some(Ok(_)) => panic!("bad flag"),
+        None => panic!("missing"),
+    };
+    assert!(err.contains("Unknown argument."));
+    assert!(tui_request(&args(&["ping"])).is_none());
+    assert!(tui_request(&args(&["tui", "--help"])).is_none());
+}
+
+#[test]
+fn script_poll_publishes_or_returns_the_listed_error() {
+    let cwd = temp("script-poll");
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let request =
-        client.request("/rest/api/1.0/inbox/pull-requests?role=REVIEWER&start=0&limit=25");
-    let (code, stdout, stderr, _) = run(
-        &["ls", "--verbose"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: vec![request],
-        })),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(stdout, "Nothing needs your attention.\n");
-    assert!(stderr.contains("Bearer ***"));
-    assert!(!stderr.contains("secret-token"));
-    let (missing, _, err, _) = run(
-        &["ls"],
-        &cwd,
-        &Env::new(),
-        listed_script(Ok(Listed {
+    let mut script = Script {
+        version: None,
+        report: None,
+        listed: Some(Ok(Listed {
             snapshot: sample_snapshot(Vec::new(), Vec::new()),
             requests: Vec::new(),
         })),
-    );
-    assert_eq!(missing, 1);
-    assert!(err.contains("base_url"));
-    let (rejected, out, token, _) = run(&["ls"], &cwd, &env, listed_script(Err(Error::Http(401))));
-    assert_eq!(rejected, 11);
-    assert!(out.is_empty());
-    assert!(token.contains("Token rejected."));
-    let (url_code, _, _, origin) = run(
-        &["ls", "--url", "https://ls.example.invalid"],
-        &cwd,
-        &env,
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
-    assert_eq!(url_code, 0);
-    assert!(origin.starts_with("https://ls.example.invalid"));
+        origin: String::new(),
+    };
+    let mut published = false;
+    match script.poll(&client, 0, &[], &mut |_| {
+        published = true;
+        Ok(())
+    }) {
+        Ok(_) => assert!(published),
+        Err(_) => panic!("publish"),
+    }
+    script.listed = Some(Err(Error::Http(401)));
+    match script.poll(&client, 0, &[], &mut |_| Ok(())) {
+        Err(err) => assert!(matches!(err.error, Error::Http(401))),
+        Ok(_) => panic!("http"),
+    }
+    script.listed = Some(Ok(Listed {
+        snapshot: sample_snapshot(Vec::new(), Vec::new()),
+        requests: Vec::new(),
+    }));
+    match script.poll(&client, 0, &[], &mut |_| {
+        Err(Error::Io(std::io::Error::other("disk")))
+    }) {
+        Err(err) => assert!(matches!(err.error, Error::Io(_))),
+        Ok(_) => panic!("io"),
+    }
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -847,8 +775,8 @@ fn live_list_reads_http_status() {
     env.base_url = Some(format!("http://127.0.0.1:{port}"));
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
     let client = Client::new(curl_bin::PROGRAM, &config);
-    let err = match Live.list(&client, 0, &mut |_| Ok(())) {
-        Err(err) => err,
+    let err = match Live.poll(&client, 0, &[], &mut |_| Ok(())) {
+        Err(err) => err.error,
         Ok(_) => panic!("expected HTTP 500"),
     };
     assert!(matches!(err, Error::Http(500)), "{err}");
@@ -857,193 +785,13 @@ fn live_list_reads_http_status() {
 }
 
 #[test]
-fn ls_notifies_each_change_and_logs_a_missing_notifier_once() {
-    let cwd = temp("notify");
-    let env = env_token();
-    let rows = || {
-        sample_snapshot(
-            vec![sample_row(
-                "PRJ",
-                "repo",
-                12,
-                "Fix the pipe",
-                false,
-                false,
-                false,
-            )],
-            vec![sample_row(
-                "PRJ",
-                "pipe",
-                21,
-                "Waiting on Sam",
-                false,
-                true,
-                true,
-            )],
-        )
-    };
-    let mut script = listed_script(Ok(Listed {
-        snapshot: rows(),
-        requests: Vec::new(),
-    }));
-    script.fail_notify = true;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut script,
-    );
-    let err = String::from_utf8(stderr).unwrap();
-    let out = String::from_utf8(stdout).unwrap();
-    assert_eq!(code, 0, "{err}");
-    assert!(out.contains("Needs review"));
-    assert_eq!(script.toasts.len(), 2);
-    let program = super::notify_bin::PROGRAM;
-    assert_eq!(
-        err.matches(&format!("{program} must be on PATH.")).count(),
-        1
-    );
-    assert_toast(
-        &script.toasts[0],
-        "PRJ/repo#12 needs review\nhttps://git.example.invalid/pull/12",
-    );
-    assert_toast(
-        &script.toasts[1],
-        "PRJ/pipe#21 waiting\nhttps://git.example.invalid/pull/21",
-    );
-
-    let mut quiet = listed_script(Ok(Listed {
-        snapshot: rows(),
-        requests: Vec::new(),
-    }));
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut quiet,
-    );
-    assert_eq!(code, 0);
-    assert!(quiet.toasts.is_empty());
-    assert!(String::from_utf8(stderr).unwrap().is_empty());
-
-    let mut gone = listed_script(Ok(Listed {
-        snapshot: sample_snapshot(
-            vec![sample_row(
-                "PRJ",
-                "repo",
-                12,
-                "Fix the pipe",
-                false,
-                false,
-                false,
-            )],
-            Vec::new(),
-        ),
-        requests: Vec::new(),
-    }));
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["ls"]),
-        &cwd,
-        &env,
-        &mut stdout,
-        &mut stderr,
-        &mut gone,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(gone.toasts.len(), 1);
-    assert_toast(
-        &gone.toasts[0],
-        "PRJ/pipe#21 merged or declined\nhttps://git.example.invalid/pull/21",
-    );
-    fs::remove_dir_all(&cwd).unwrap();
-}
-
-fn assert_toast(toast: &host::Toast, body: &str) {
-    let args = host::toast_arguments(toast);
-    let text = args
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(text.contains(body), "{text}");
-    #[cfg(unix)]
-    {
-        match toast {
-            host::Toast::NotifySend {
-                program,
-                title,
-                expire,
-                ..
-            } => {
-                assert_eq!(program, "notify-send");
-                assert_eq!(title, "Bistill");
-                assert_eq!(*expire, Some(Duration::from_millis(10_000)));
-            }
-            host::Toast::PowerShell { .. } => panic!("linux toast is notify-send"),
-        }
-        assert!(text.contains("--expire-time"));
-        assert!(text.contains("10000"));
-    }
-    #[cfg(windows)]
-    {
-        match toast {
-            host::Toast::PowerShell {
-                program,
-                title,
-                url,
-                ..
-            } => {
-                assert_eq!(program, "powershell.exe");
-                assert_eq!(title, "Bistill");
-                assert_eq!(url.as_deref(), Some(body.lines().nth(1).unwrap()));
-            }
-            host::Toast::NotifySend { .. } => panic!("windows toast is powershell"),
-        }
-    }
-}
-
-#[test]
 fn ls_refuses_a_corrupt_snapshot() {
     let cwd = temp("corrupt-snapshot");
     fs::write(cwd.join("snapshot.json"), "{").unwrap();
-    let (code, stdout, stderr, _) = run(
-        &["ls"],
-        &cwd,
-        &env_token(),
-        listed_script(Ok(Listed {
-            snapshot: sample_snapshot(Vec::new(), Vec::new()),
-            requests: Vec::new(),
-        })),
-    );
+    let mut session = poller(&cwd, Vec::new());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
     assert_eq!(code, 5, "{stderr}");
-    assert!(stdout.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
-}
-
-#[test]
-fn live_notify_reports_a_missing_program() {
-    let toast = host::Toast::NotifySend {
-        program: "bistill-missing-notify".to_owned(),
-        title: "Bistill".to_owned(),
-        body: "body".to_owned(),
-        expire: None,
-        timeout: Duration::from_secs(1),
-    };
-    let err = Live.notify(&toast).unwrap_err();
-    assert!(matches!(
-        err,
-        host::Error::Missing { program } if program == "bistill-missing-notify"
-    ));
 }
 
 const SCREEN_NOW: u64 = 1_700_000_000_000;
@@ -1079,6 +827,25 @@ fn glyph_char(glyph: &tui::Glyph) -> char {
         tui::Glyph::Single(text) | tui::Glyph::Wide(text) => text.chars().next().unwrap_or(' '),
         tui::Glyph::Tail => ' ',
     }
+}
+
+fn find_style(buffer: &tui::Buffer, word: &str) -> tui::Style {
+    style_of(buffer, word).into_iter().next().unwrap()
+}
+
+fn style_of(buffer: &tui::Buffer, word: &str) -> Vec<tui::Style> {
+    let mut found = Vec::new();
+    for y in 0..buffer.height() {
+        let text = row_text(buffer, y);
+        let mut start = 0usize;
+        while let Some(at) = text[start..].find(word) {
+            let column = text[..start + at].chars().count();
+            let x = u16::try_from(column).unwrap();
+            found.push(buffer.get(x, y).unwrap().style);
+            start += at + word.len();
+        }
+    }
+    found
 }
 
 fn row_text(buffer: &tui::Buffer, y: u16) -> String {
@@ -1210,9 +977,10 @@ fn screen_draws_both_layouts_and_status_lines() {
     let top = row_text(&wide, 0);
     assert!(top.contains("Needs review"));
     assert!(top.contains("Waiting"));
-    assert_eq!(row_of(&wide, "Detail"), Some(1));
+    assert!(row_text(&wide, 1).contains("repo#12"));
     let shown = grid_text(&wide);
     assert!(shown.contains("and 3 more"));
+    assert!(shown.contains("No activity yet."));
     assert!(shown.contains("PRJ/repo#12"));
     assert!(shown.contains("Fix the pipe"));
     assert!(shown.contains("45s"));
@@ -1225,11 +993,96 @@ fn screen_draws_both_layouts_and_status_lines() {
     assert!(shown.contains("successful"));
     assert!(shown.contains("in progress"));
     assert!(shown.contains("1/6"));
-    assert!(shown.contains("R0 UNAPPROVED"));
-    assert!(shown.contains("R1 NEEDS_WORK"));
-    assert!(shown.contains("R2 APPROVED"));
     assert!(row_text(&wide, 23).contains("Fetching from Bitbucket..."));
-    assert!(wide.get(1, 2).unwrap().style.reverse);
+    let picked = wide.get(1, 2).unwrap().style;
+    assert_eq!(picked.fg, Some(tui::Color::BrightWhite));
+    assert_eq!(picked.bg, Some(tui::Color::Blue));
+    assert!(!picked.reverse);
+    assert_eq!(find_style(&wide, "draft").fg, Some(tui::Color::Magenta));
+    assert_eq!(find_style(&wide, "in progress").fg, Some(tui::Color::Cyan));
+    assert_eq!(
+        find_style(&wide, "Waiting").fg,
+        Some(tui::Color::BrightBlack)
+    );
+    assert_eq!(
+        find_style(&wide, "PRJ/widget#13").fg,
+        Some(tui::Color::BrightBlack)
+    );
+    assert_eq!(find_style(&wide, "1/6").fg, Some(tui::Color::BrightBlack));
+    assert_eq!(
+        find_style(&wide, "and 3 more").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert!(find_style(&wide, "and 3 more").bold);
+    assert_eq!(wide.get(0, 23).unwrap().style.fg, Some(tui::Color::Cyan));
+    let keys_at = u16::try_from(row_text(&wide, 23).find("j/k").unwrap()).unwrap();
+    assert!(wide.get(keys_at, 23).unwrap().style.fg.is_none());
+    assert!(wide.get(keys_at, 23).unwrap().style.bold);
+    let mut probe = screen::Screen::new();
+    let _ = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let shifted = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&shifted, 1).contains("widget#13"));
+    assert!(side_text(&shifted, 80).contains("No activity yet."));
+    assert!(
+        style_of(&shifted, "failed")
+            .iter()
+            .any(|style| { style.fg == Some(tui::Color::BrightRed) && style.bold })
+    );
+    let mut ignored = std::collections::BTreeSet::new();
+    ignored.insert("PRJ/repo/16".to_owned());
+    probe.set_marks(std::collections::BTreeMap::new(), ignored);
+    let badged = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        find_style(&badged, "ignored").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Tab), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let _ = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let waiting = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert_eq!(
+        find_style(&waiting, "stale").fg,
+        Some(tui::Color::BrightYellow)
+    );
+    assert_eq!(
+        act(&mut probe, key(tui::KeyCode::Char('k')), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    let needs_work = draw_screen(&mut probe, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(
+        style_of(&needs_work, "needs work")
+            .iter()
+            .any(|style| { style.fg == Some(tui::Color::BrightRed) })
+    );
+    let mut ship = screen::Screen::new();
+    let _ = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    for _ in 0..2 {
+        assert_eq!(
+            act(&mut ship, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+            screen::Action::None
+        );
+    }
+    let building = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&building, 1).contains("repo#15"));
+    assert!(side_text(&building, 80).contains("No activity yet."));
+    for _ in 0..3 {
+        assert_eq!(
+            act(&mut ship, key(tui::KeyCode::Char('j')), Some(&snapshot), 0),
+            screen::Action::None
+        );
+    }
+    let merged = draw_screen(&mut ship, 160, 24, Some(&snapshot), &holder, 0);
+    assert!(row_text(&merged, 1).contains("repo#18"));
 
     let again = draw_screen(&mut screen, 160, 24, Some(&snapshot), &holder, 0);
     assert!(grid_text(&again).contains("1/6"));
@@ -1242,9 +1095,9 @@ fn screen_draws_both_layouts_and_status_lines() {
         &holder,
         0,
     );
-    let detail = row_of(&stacked, "Detail").unwrap();
+    let detail = row_of(&stacked, "No activity yet.").unwrap();
     assert!(detail > 1);
-    assert!(!row_text(&stacked, 1).contains("Detail"));
+    assert!(!row_text(&stacked, 1).contains("No activity yet."));
 
     let ready = screen::Role::Holder(screen::Phase::Ready);
     let ready_grid = draw_screen(
@@ -1255,7 +1108,7 @@ fn screen_draws_both_layouts_and_status_lines() {
         &ready,
         0,
     );
-    assert!(row_text(&ready_grid, 23).trim().is_empty());
+    assert!(row_text(&ready_grid, 23).contains("j/k move"));
 
     let auth = screen::Role::Holder(screen::Phase::Auth);
     let auth_grid = draw_screen(
@@ -1267,6 +1120,10 @@ fn screen_draws_both_layouts_and_status_lines() {
         0,
     );
     assert!(row_text(&auth_grid, 23).contains("Token rejected."));
+    assert_eq!(
+        auth_grid.get(0, 23).unwrap().style.fg,
+        Some(tui::Color::BrightRed)
+    );
 
     let tls = screen::Role::Holder(screen::Phase::Tls);
     let tls_grid = draw_screen(
@@ -1302,18 +1159,12 @@ fn screen_draws_both_layouts_and_status_lines() {
         0,
     );
     assert!(row_text(&limited_grid, 23).contains("Rate limited."));
-
-    let viewer = screen::Role::Viewer { pid: 42 };
-    let viewer_grid = draw_screen(
-        &mut screen::Screen::new(),
-        160,
-        24,
-        Some(&snapshot),
-        &viewer,
-        0,
+    assert_eq!(
+        limited_grid.get(0, 23).unwrap().style.fg,
+        Some(tui::Color::BrightYellow)
     );
-    assert!(row_text(&viewer_grid, 23).contains("Holder 42."));
-    let loading = draw_screen(&mut screen::Screen::new(), 160, 24, None, &viewer, 0);
+
+    let loading = draw_screen(&mut screen::Screen::new(), 160, 24, None, &holder, 0);
     let loading_text = grid_text(&loading);
     assert!(row_text(&loading, 23).contains("Fetching from Bitbucket..."));
     assert!(loading_text.contains("0/0"));
@@ -1322,6 +1173,10 @@ fn screen_draws_both_layouts_and_status_lines() {
     let empty = sample_snapshot(Vec::new(), Vec::new());
     let empty_grid = draw_screen(&mut screen::Screen::new(), 160, 24, Some(&empty), &ready, 0);
     assert!(grid_text(&empty_grid).contains("Nothing needs your attention."));
+    assert_eq!(
+        find_style(&empty_grid, "Nothing").fg,
+        Some(tui::Color::Green)
+    );
 
     let mut tiny = screen::Screen::new();
     let _ = draw_screen(&mut tiny, 0, 4, Some(&snapshot), &holder, 0);
@@ -1391,6 +1246,8 @@ fn screen_keys_filter_help_and_mouse() {
     );
     let draft = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
     assert!(grid_text(&draft).contains("2/6"));
+    assert!(side_text(&draft, 80).contains("widget#13"));
+    assert!(side_text(&draft, 80).contains("No activity yet."));
     assert!(!side_text(&draft, 80).contains("build "));
 
     let _ = act(
@@ -1400,7 +1257,8 @@ fn screen_keys_filter_help_and_mouse() {
         0,
     );
     let ship = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&ship, 80).contains("build in progress"));
+    assert!(side_text(&ship, 80).contains("repo#15"));
+    assert!(side_text(&ship, 80).contains("No activity yet."));
 
     let _ = act(
         &mut screen,
@@ -1409,11 +1267,10 @@ fn screen_keys_filter_help_and_mouse() {
         0,
     );
     let quiet = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&quiet, 80).contains("Quiet change"));
-    assert!(side_text(&quiet, 80).contains("unanswered as author 0"));
-    assert!(!side_text(&quiet, 80).contains("build "));
-    assert!(!side_text(&quiet, 80).contains("conflicted"));
-    assert!(!side_text(&quiet, 80).contains("mergeable"));
+    assert!(side_text(&quiet, 80).contains("repo#16"));
+    assert!(side_text(&quiet, 80).contains("No activity yet."));
+    assert!(!side_text(&quiet, 80).contains("Quiet change"));
+    assert!(!side_text(&quiet, 80).contains("unanswered"));
 
     let _ = act(
         &mut screen,
@@ -1439,8 +1296,10 @@ fn screen_keys_filter_help_and_mouse() {
     );
     let marked = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
     assert!(grid_text(&marked).contains("6/6"));
-    assert!(side_text(&marked, 80).contains("build successful"));
-    assert!(side_text(&marked, 80).contains("conflicted"));
+    assert!(side_text(&marked, 80).contains("repo#18"));
+    assert!(side_text(&marked, 80).contains("No activity yet."));
+    assert!(!side_text(&marked, 80).contains("successful"));
+    assert!(!side_text(&marked, 80).contains("conflicted"));
     assert_eq!(
         act(&mut screen, key(tui::KeyCode::Enter), Some(&snapshot), 0),
         screen::Action::Open("https://git.example.invalid/pull/18".to_owned())
@@ -1895,43 +1754,32 @@ fn screen_scrolls_the_focused_pane() {
     let top = draw_screen(&mut short, 160, 8, Some(&snapshot), &ready, 0);
     assert!(table_has(&top, "PRJ/repo#12"));
 
+    let mut fed = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    fed.events = feed_events();
+    let snapshot = sample_snapshot(vec![fed], Vec::new());
     let mut screen = screen::Screen::new();
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    for _ in 0..3 {
-        let _ = act(
-            &mut screen,
-            key(tui::KeyCode::Char('j')),
-            Some(&snapshot),
-            0,
-        );
-    }
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
+    let _ = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
     assert_eq!(
         act(&mut screen, press_at(81, 4), Some(&snapshot), 10),
         screen::Action::None
     );
+    let head = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    let head_side = side_text(&head, 80);
+    assert!(head_side.contains("You commented"));
+    assert!(!head_side.contains("tail of the feed"));
     let _ = act(
         &mut screen,
         tui::Event::Wheel {
             direction: tui::Wheel::Down,
-            column: 81,
-            row: 4,
+            column: 90,
+            row: 6,
         },
         Some(&snapshot),
         0,
     );
-    let quiet = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&quiet, 80).contains("Quiet change"));
-    assert_eq!(
-        act(&mut screen, press_at(1, 2), Some(&snapshot), 20),
-        screen::Action::None
-    );
-    let _ = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert_eq!(
-        act(&mut screen, press_at(81, 4), Some(&snapshot), 30),
-        screen::Action::None
-    );
-    for _ in 0..20 {
+    let stepped = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert_ne!(side_text(&stepped, 80), head_side);
+    for _ in 0..40 {
         let _ = act(
             &mut screen,
             tui::Event::Wheel {
@@ -1943,16 +1791,9 @@ fn screen_scrolls_the_focused_pane() {
             0,
         );
     }
-    let tail = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(!side_text(&tail, 80).contains("R0 UNAPPROVED"));
-    assert!(side_text(&tail, 80).contains("feature -> main"));
-    assert!(side_text(&tail, 80).contains("unanswered as author 2"));
-    assert!(side_text(&tail, 80).contains("unanswered as reviewer 3"));
-    assert!(side_text(&tail, 80).contains("open tasks 4"));
-    assert!(side_text(&tail, 80).contains("build failed"));
-    assert!(side_text(&tail, 80).contains("conflicted"));
-    assert!(side_text(&tail, 80).contains("mergeable"));
-    assert!(side_text(&tail, 80).contains("https://git.example.invalid/pull/12"));
+    let tail = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert!(side_text(&tail, 80).contains("tail of the feed"));
+    assert!(!side_text(&tail, 80).contains("You commented"));
     let before = side_text(&tail, 80);
     let _ = act(
         &mut screen,
@@ -1964,9 +1805,9 @@ fn screen_scrolls_the_focused_pane() {
         Some(&snapshot),
         0,
     );
-    let same = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
+    let same = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
     assert_eq!(side_text(&same, 80), before);
-    for _ in 0..20 {
+    for _ in 0..40 {
         let _ = act(
             &mut screen,
             tui::Event::Wheel {
@@ -1978,20 +1819,8 @@ fn screen_scrolls_the_focused_pane() {
             0,
         );
     }
-    let head = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&head, 80).contains("R0 UNAPPROVED"));
-    let _ = act(
-        &mut screen,
-        tui::Event::Wheel {
-            direction: tui::Wheel::Up,
-            column: 90,
-            row: 6,
-        },
-        Some(&snapshot),
-        0,
-    );
-    let still = draw_screen(&mut screen, 160, 24, Some(&snapshot), &ready, 0);
-    assert!(side_text(&still, 80).contains("R0 UNAPPROVED"));
+    let back = draw_screen(&mut screen, 160, 12, Some(&snapshot), &ready, 0);
+    assert!(side_text(&back, 80).contains("You commented"));
 }
 
 fn table_has(buffer: &tui::Buffer, needle: &str) -> bool {
@@ -2025,6 +1854,215 @@ fn screen_formats_clock_text() {
     assert_eq!(screen::absolute(0, -60), "1970-01-01 00:00");
     assert_eq!(screen::absolute(0, 3_600), "1970-01-01 01:00");
     assert_eq!(screen::absolute(1_000_000_000_000, 0), "2001-09-09 01:46");
+    assert_eq!(screen::ago(SCREEN_NOW, SCREEN_NOW), "just now");
+    assert_eq!(screen::ago(SCREEN_NOW - 59_000, SCREEN_NOW), "just now");
+    assert_eq!(screen::ago(SCREEN_NOW - 60_000, SCREEN_NOW), "1m ago");
+    assert_eq!(
+        screen::ago(SCREEN_NOW - 3 * 3_600_000, SCREEN_NOW),
+        "3h ago"
+    );
+    assert_eq!(
+        screen::ago(SCREEN_NOW - 5 * 86_400_000, SCREEN_NOW),
+        "5d ago"
+    );
+    assert_eq!(screen::ago(SCREEN_NOW + 1_000, SCREEN_NOW), "just now");
+}
+
+fn activity(
+    id: u64,
+    age_ms: u64,
+    slug: &str,
+    name: &str,
+    kind: bistill_lib::EventKind,
+    text: &str,
+) -> bistill_lib::Event {
+    bistill_lib::Event {
+        id,
+        created_ms: SCREEN_NOW.saturating_sub(age_ms),
+        actor_slug: slug.to_owned(),
+        actor_name: name.to_owned(),
+        kind,
+        text: text.to_owned(),
+        thread: Vec::new(),
+        added_user: false,
+    }
+}
+
+fn feed_events() -> Vec<bistill_lib::Event> {
+    use bistill_lib::EventKind;
+    vec![
+        activity(
+            10,
+            30_000,
+            "jcitizen",
+            "Jane",
+            EventKind::Commented,
+            "Looks good",
+        ),
+        activity(
+            9,
+            3 * 3_600_000,
+            "sam",
+            "Sam",
+            EventKind::Approved,
+            "Ship it",
+        ),
+        activity(8, 0, "jcitizen", "Jane", EventKind::Approved, ""),
+        activity(7, 120_000, "pat", "Pat", EventKind::Pushed, "valve"),
+        activity(6, 0, "jcitizen", "Jane", EventKind::Pushed, ""),
+        activity(5, 5 * 86_400_000, "pat", "Pat", EventKind::Reopened, ""),
+        activity(4, 0, "jcitizen", "Jane", EventKind::Reopened, ""),
+        activity(3, 0, "pat", "Pat", EventKind::Added, ""),
+        activity(2, 0, "pat", "Pat", EventKind::Other, "noise"),
+        activity(
+            1,
+            9 * 86_400_000,
+            "pat",
+            "Pat",
+            EventKind::Commented,
+            "tail of the feed",
+        ),
+    ]
+}
+
+#[test]
+fn screen_keeps_the_pull_request_when_rows_move() {
+    use bistill_lib::EventKind;
+    let ready = screen::Role::Holder(screen::Phase::Ready);
+    let fetching = screen::Role::Holder(screen::Phase::Fetching);
+    let mut fix = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    fix.events = vec![activity(
+        4,
+        3 * 3_600_000,
+        "sam",
+        "Sam",
+        EventKind::Approved,
+        "Looks good",
+    )];
+    let mut draft = sample_row("PRJ", "widget", 13, "Draft note", true, false, false);
+    draft.events = vec![
+        activity(
+            9,
+            30_000,
+            "pat",
+            "Pat",
+            EventKind::Commented,
+            "Please look at the valve",
+        ),
+        activity(1, 0, "jcitizen", "Jane", EventKind::Commented, "mine"),
+    ];
+    let mut screen = screen::Screen::new();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert(draft.id.clone(), 2);
+    screen.set_marks(floors, std::collections::BTreeSet::new());
+    let ordered = sample_snapshot(vec![fix.clone(), draft.clone()], Vec::new());
+    let _ = draw_screen(&mut screen, 160, 24, Some(&ordered), &ready, 0);
+    assert_eq!(
+        act(&mut screen, key(tui::KeyCode::Char('j')), Some(&ordered), 0),
+        screen::Action::None
+    );
+    let picked = draw_screen(&mut screen, 160, 24, Some(&ordered), &ready, 0);
+    assert!(side_text(&picked, 80).contains("widget#13"));
+    assert!(side_text(&picked, 80).contains("Comment from Pat"));
+    assert!(side_text(&picked, 80).contains("Please look at the valve"));
+    assert!(side_text(&picked, 80).contains("You commented"));
+    assert!(side_text(&picked, 80).contains("new"));
+    assert!(!side_text(&picked, 80).contains("Draft note"));
+    assert!(!side_text(&picked, 80).contains("http"));
+    assert_eq!(find_style(&picked, "new").fg, Some(tui::Color::Green));
+    assert!(find_style(&picked, "new").bold);
+    let swapped = sample_snapshot(vec![draft.clone(), fix.clone()], Vec::new());
+    let stayed = draw_screen(&mut screen, 160, 24, Some(&swapped), &ready, 0);
+    assert!(side_text(&stayed, 80).contains("widget#13"));
+    assert!(side_text(&stayed, 80).contains("Comment from Pat"));
+    assert_eq!(find_style(&stayed, "Draft note").bg, Some(tui::Color::Blue));
+    let gone = sample_snapshot(vec![fix.clone()], Vec::new());
+    let held = draw_screen(&mut screen, 160, 24, Some(&gone), &fetching, 0);
+    assert!(side_text(&held, 80).contains("widget#13"));
+    assert!(side_text(&held, 80).contains("Please look at the valve"));
+    assert_ne!(find_style(&held, "Fix the pipe").bg, Some(tui::Color::Blue));
+    let adopted = draw_screen(&mut screen, 160, 24, Some(&gone), &ready, 0);
+    assert!(side_text(&adopted, 80).contains("repo#12"));
+    assert!(side_text(&adopted, 80).contains("Approved by Sam"));
+    assert!(side_text(&adopted, 80).contains("3h ago"));
+    assert_eq!(
+        find_style(&adopted, "Fix the pipe").bg,
+        Some(tui::Color::Blue)
+    );
+
+    let narrow = rule_parts(true, "3h ago", 3);
+    assert_eq!(narrow, vec!["new".to_owned()]);
+    assert!(rule_parts(true, "3h ago", 0).is_empty());
+    let dashes = rule_parts(false, "", 4);
+    assert!(dashes.iter().any(|text| text.contains('─')));
+    assert_eq!(
+        screen::verb_line(
+            &activity(1, 0, "x", "Pat", EventKind::Other, "noise"),
+            "jcitizen"
+        ),
+        ""
+    );
+    assert!(screen::wrap_text("", 0).is_empty());
+    assert_eq!(
+        screen::wrap_text("ab", 1),
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+    assert_eq!(
+        screen::wrap_text("a\n\nb", 10),
+        vec!["a".to_owned(), String::new(), "b".to_owned()]
+    );
+    assert_eq!(
+        screen::wrap_text("a字", 2),
+        vec!["a".to_owned(), "字".to_owned()]
+    );
+    let mut buffer = tui::Buffer::empty(4, 2);
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 2,
+        },
+        &[],
+    );
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 0,
+        },
+        &[],
+    );
+    let row = vec![
+        screen::FeedSpan {
+            text: "abcd".to_owned(),
+            style: tui::Style::default(),
+        },
+        screen::FeedSpan {
+            text: "z".to_owned(),
+            style: tui::Style::default(),
+        },
+    ];
+    screen::paint_feed(
+        &mut buffer,
+        tui::Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 1,
+        },
+        &[row],
+    );
+}
+
+fn rule_parts(unread: bool, time: &str, width: usize) -> Vec<String> {
+    screen::rule_spans(unread, time, width)
+        .into_iter()
+        .map(|span| span.text)
+        .collect()
 }
 
 fn watch_dir(name: &str) -> PathBuf {
@@ -2046,10 +2084,10 @@ struct Poller {
     polls: u32,
     stop_after_pauses: Option<u32>,
     refresh: bool,
+    quit: bool,
     readonly_on: Option<u32>,
     state: PathBuf,
-    toasts: Vec<host::Toast>,
-    fail_notify: bool,
+    cached: Vec<usize>,
 }
 
 impl Session for Poller {
@@ -2061,32 +2099,14 @@ impl Session for Poller {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(
-        &mut self,
-        _: &Client,
-        _: u64,
-        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        Err(Error::Auth("unused".to_owned()))
-    }
-
-    fn notify(&mut self, toast: &host::Toast) -> Result<(), host::Error> {
-        self.toasts.push(toast.clone());
-        if self.fail_notify {
-            Err(host::Error::Missing {
-                program: notify_bin::PROGRAM.to_owned(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
     fn poll(
         &mut self,
         _: &Client,
         _: u64,
+        cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
+        self.cached.push(cached.len());
         self.polls += 1;
         if self.readonly_on == Some(self.polls) {
             self.readonly_on = None;
@@ -2117,13 +2137,22 @@ impl Session for Poller {
         self.now
     }
 
-    fn pause(&mut self, duration: Duration) {
+    fn pause(&mut self, duration: Duration, _wake: &std::sync::mpsc::Receiver<Nudge>) -> Paused {
         self.pauses.push(duration.as_millis() as u64);
+        if self.quit {
+            return Paused::Quit;
+        }
+        let wrote = self.refresh;
         if self.refresh {
             fs::write(self.state.join("refresh"), b"").unwrap();
             self.refresh = false;
         }
         self.now += self.jump;
+        if wrote {
+            Paused::Refresh
+        } else {
+            Paused::Elapsed
+        }
     }
 
     fn again(&mut self) -> bool {
@@ -2147,10 +2176,10 @@ fn poller(cwd: &Path, steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Po
         polls: 0,
         stop_after_pauses: None,
         refresh: false,
+        quit: false,
         readonly_on: None,
         state: cwd.to_owned(),
-        toasts: Vec::new(),
-        fail_notify: false,
+        cached: Vec::new(),
     }
 }
 
@@ -2176,18 +2205,26 @@ fn fault(status: u16, retry_after_ms: Option<u64>) -> Result<Listed, bistill_lib
     })
 }
 
-fn run_watch(cwd: &Path, poller: &mut Poller) -> (i32, String) {
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch", "--verbose"]),
-        cwd,
-        &env_token(),
-        &mut stdout,
-        &mut stderr,
-        poller,
-    );
-    (code, String::from_utf8(stderr).unwrap())
+fn run_watch(cwd: &Path, poller: &mut Poller, verbose: bool) -> (i32, String) {
+    let config = bistill_lib::load(cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
+    let previous = match bistill_lib::read_snapshot(&config.state_dir) {
+        Ok(previous) => previous,
+        Err(err) => return (bistill_lib::exit_code(&err), explain(&err)),
+    };
+    let held = match lock::acquire(&config.state_dir) {
+        Ok(lock::Acquire::Holder(held)) => held,
+        Ok(lock::Acquire::Busy { pid }) => {
+            return (1, format!("Another bistill is polling (pid {pid}).\n"));
+        }
+        Err(err) => return (1, explain(&Error::from(err))),
+    };
+    let board = std::sync::Mutex::new(watch::Board::new(previous));
+    let (nudge_tx, nudge_rx) = std::sync::mpsc::channel();
+    let (paint_tx, _paint_rx) = std::sync::mpsc::channel();
+    let outcome = watch::poll(poller, &config, verbose, &board, &nudge_rx, &paint_tx);
+    drop(nudge_tx);
+    drop(held);
+    (outcome.code, outcome.stderr)
 }
 
 #[test]
@@ -2198,15 +2235,13 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         &cwd,
         vec![listed_ok(vec![again()]), listed_ok(vec![again()])],
     );
-    session.fail_notify = true;
     session.stop_after_polls = 2;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("Bearer ***"));
     assert!(!stderr.contains("secret-token"));
-    assert_eq!(session.toasts.len(), 1);
-    assert!(stderr.contains("must be on PATH."));
-    assert_eq!(session.pauses, vec![1_000]);
+    assert_eq!(session.cached, vec![0, 1]);
+    assert_eq!(session.pauses, vec![15_000]);
     assert!(!cwd.join("poll.lock").exists());
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.needs_review.len(), 1);
@@ -2218,7 +2253,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         vec![listed_ok(vec![row]), fault(401, None), fault(401, None)],
     );
     session.stop_after_polls = 3;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("Token rejected."));
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
@@ -2232,9 +2267,9 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         vec![fault(500, None), fault(500, None), fault(500, None)],
     );
     session.stop_after_polls = 3;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
-    assert_eq!(session.pauses, vec![1_000, 1_000, 1_000]);
+    assert_eq!(session.pauses, vec![15_000, 30_000, 10_000]);
     assert!(!cwd.join("snapshot.json").exists());
 
     let cwd = watch_dir("watch-refresh");
@@ -2242,9 +2277,9 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.stop_after_polls = 2;
     session.jump = 200_000;
     session.refresh = true;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
-    assert_eq!(session.pauses, vec![1_000]);
+    assert_eq!(session.pauses, vec![120_000]);
     assert!(!cwd.join("refresh").exists());
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Ok);
@@ -2254,7 +2289,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     session.stop_after_polls = 2;
     session.stop_after_pauses = Some(1);
     session.refresh = true;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
     assert!(session.polls == 1);
 
@@ -2269,9 +2304,17 @@ fn watch_polls_backs_off_and_releases_the_lock() {
     );
     session.stop_after_polls = 3;
     session.jump = 650_000;
-    let (code, _) = run_watch(&cwd, &mut session);
+    let (code, _) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0);
     assert_eq!(session.pauses.len(), 2);
+
+    let cwd = watch_dir("watch-quit");
+    let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
+    session.stop_after_polls = 2;
+    session.quit = true;
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(session.polls, 1);
 
     let cwd = watch_dir("watch-missing");
     let mut session = poller(
@@ -2283,7 +2326,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
             retry_after_ms: None,
         })],
     );
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 2, "{stderr}");
     assert!(stderr.contains("curl must be on PATH."));
     assert!(!cwd.join("poll.lock").exists());
@@ -2296,6 +2339,7 @@ fn watch_polls_backs_off_and_releases_the_lock() {
         "watch-floor",
         "watch-cap",
         "watch-missing",
+        "watch-quit",
     ] {
         let _ = fs::remove_dir_all(
             std::env::temp_dir().join(format!("bistill-bin-{cwd}-{}", std::process::id())),
@@ -2308,7 +2352,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     let cwd = watch_dir("watch-busy");
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains(&format!("pid {}).", std::process::id())));
     assert!(cwd.join("poll.lock").exists());
@@ -2322,7 +2366,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     assert!(!super::pid_os::pid_alive(0));
     fs::write(cwd.join("poll.lock"), format!("{pid}\n")).unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     assert!(!cwd.join("poll.lock").exists());
 
@@ -2363,7 +2407,7 @@ fn watch_lock_names_a_live_pid_and_replaces_a_dead_one() {
     let cwd = watch_dir("watch-corrupt");
     fs::write(cwd.join("snapshot.json"), "{").unwrap();
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 5, "{stderr}");
     assert!(!cwd.join("poll.lock").exists());
 
@@ -2377,7 +2421,7 @@ fn watch_returns_when_the_snapshot_cannot_be_written() {
     let cwd = watch_dir("watch-write-ok");
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
     session.readonly_on = Some(1);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
 
@@ -2385,7 +2429,7 @@ fn watch_returns_when_the_snapshot_cannot_be_written() {
     let mut session = poller(&cwd, vec![listed_ok(Vec::new()), fault(401, None)]);
     session.stop_after_polls = 2;
     session.readonly_on = Some(2);
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     fs::set_permissions(&cwd, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(code, 1, "{stderr}");
     fs::remove_dir_all(&cwd).unwrap();
@@ -2443,56 +2487,10 @@ fn watch_status_follows_the_failure() {
         ],
     );
     session.stop_after_polls = 2;
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 0, "{stderr}");
     let snapshot = bistill_lib::read_snapshot(&cwd).unwrap().unwrap();
     assert_eq!(snapshot.status, bistill_lib::SnapshotStatus::Tls);
-    fs::remove_dir_all(&cwd).unwrap();
-}
-
-#[test]
-fn live_clarify_reads_a_merged_pull_request() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    listener.set_nonblocking(true).expect("nonblocking");
-    let thread = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut sock, _)) => {
-                    let _ = sock.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 1024];
-                    let _ = sock.read(&mut buf);
-                    let body = br#"{"state":"MERGED"}"#;
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes());
-                    let _ = sock.write_all(body);
-                    break;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    let cwd = temp("live-gone");
-    let mut env = env_token();
-    env.base_url = Some(format!("http://127.0.0.1:{port}"));
-    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env).unwrap();
-    let client = Client::new(curl_bin::PROGRAM, &config);
-    let mut changes = vec![bistill_lib::Change {
-        id: "PRJ/repo/12".to_owned(),
-        html_url: "https://git.example.invalid/pull/12".to_owned(),
-        reasons: vec![bistill_lib::Reason::Gone],
-        gone_text: String::new(),
-    }];
-    Live.clarify(&client, &mut changes);
-    thread.join().expect("server");
-    assert_eq!(changes[0].gone_text, "merged");
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -2501,7 +2499,7 @@ fn live_poll_reports_a_missing_program() {
     let cwd = watch_dir("live-poll");
     let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
     let client = Client::new("bistill-missing-poll", &config);
-    let err = match Live.poll(&client, 1, &mut |_| Ok(())) {
+    let err = match Live.poll(&client, 1, &[], &mut |_| Ok(())) {
         Err(err) => err,
         Ok(_) => panic!("missing"),
     };
@@ -2511,47 +2509,260 @@ fn live_poll_reports_a_missing_program() {
     ));
     assert!(Live.again());
     assert!(Live.now_ms() > 0);
-    Live.pause(Duration::from_millis(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    assert!(matches!(
+        Live.pause(Duration::from_millis(0), &rx),
+        Paused::Elapsed
+    ));
+    drop(tx);
+    assert!(matches!(
+        Live.pause(Duration::from_millis(0), &rx),
+        Paused::Quit
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Nudge::Refresh).unwrap();
+    assert!(matches!(
+        Live.pause(Duration::from_secs(2), &rx),
+        Paused::Refresh
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Nudge::Quit).unwrap();
+    assert!(matches!(
+        Live.pause(Duration::from_secs(2), &rx),
+        Paused::Quit
+    ));
     fs::remove_dir_all(&cwd).unwrap();
 }
 
 #[test]
-fn watch_reports_config_and_lock_errors() {
-    let cwd = watch_dir("watch-config");
-    let mut session = poller(&cwd, Vec::new());
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch"]),
-        &cwd,
-        &Env::new(),
-        &mut stdout,
-        &mut stderr,
-        &mut session,
-    );
-    assert_eq!(code, 1);
+fn draw_waits_for_a_publish_an_age_and_quit() {
+    let cwd = watch_dir("draw-wait");
+    let config = bistill_lib::load(&cwd, &bistill_lib::Flags::default(), &env_token()).unwrap();
+    let board = std::sync::Mutex::new(watch::Board::new(None));
+    let (tray_tx, _tray_rx) = std::sync::mpsc::channel();
+    let (nudge_tx, _nudge_rx) = std::sync::mpsc::channel();
+    let mut screen = screen::Screen::new();
+    let mut open = |_url: &str| Ok(());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = app::Out {
+        tray: &tray_tx,
+        nudge: &nudge_tx,
+    };
+    assert!(!app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::ZERO),
+    ));
+    drop(tx);
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::ZERO),
+    ));
+    assert!(matches!(app::next_step(&rx, None), app::Step::Gone));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Republish).unwrap();
+    assert!(matches!(
+        app::next_step(&rx, None),
+        app::Step::Wake(watch::Wake::Republish)
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Stop).unwrap();
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Republish).unwrap();
+    tx.send(watch::Wake::Input(tui::Event::Key(tui::KeyCode::Char('?'))))
+        .unwrap();
+    assert!(!app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(watch::Wake::Input(tui::Event::Key(tui::KeyCode::Char('q'))))
+        .unwrap();
+    assert!(app::take_wakes(
+        &mut screen,
+        &board,
+        &config,
+        &mut open,
+        &out,
+        &rx,
+        Some(Duration::from_secs(1)),
+    ));
+    assert!(board.lock().unwrap().stop);
     fs::remove_dir_all(&cwd).unwrap();
+}
 
+#[test]
+fn next_age_tracks_the_visible_unit() {
+    assert!(screen::next_age(None, 1_000).is_none());
+    let empty = sample_snapshot(Vec::new(), Vec::new());
+    assert!(screen::next_age(Some(&empty), 1_000).is_none());
+    let now = 10_000_000_000u64;
+    let mut future = sample_row("PRJ", "repo", 1, "Later", false, false, false);
+    future.updated_ms = now + 5_000;
+    let ahead = sample_snapshot(vec![future], Vec::new());
+    assert!(screen::next_age(Some(&ahead), now).is_none());
+
+    let cases = [
+        (0u64, 1_000u64),
+        (500, 500),
+        (90_000, 30_000),
+        (7_200_000, 3_600_000),
+        (5 * 86_400_000, 86_400_000),
+    ];
+    for (elapsed, step) in cases {
+        let mut row = sample_row("PRJ", "repo", 1, "Aged", false, false, false);
+        row.updated_ms = now - elapsed;
+        let snapshot = sample_snapshot(vec![row], Vec::new());
+        assert_eq!(
+            screen::next_age(Some(&snapshot), now),
+            Some(Duration::from_millis(step)),
+            "{elapsed}"
+        );
+    }
+    let ago_cases = [
+        (10_000u64, 50_000u64),
+        (3_600_000, 3_600_000),
+        (86_400_000, 86_400_000),
+    ];
+    for (elapsed, step) in ago_cases {
+        let mut row = sample_row("PRJ", "repo", 1, "Noted", false, false, false);
+        row.updated_ms = now + 1;
+        row.events.push(bistill_lib::Event {
+            id: 1,
+            created_ms: now - elapsed,
+            actor_slug: "pat".to_owned(),
+            actor_name: "Pat".to_owned(),
+            kind: bistill_lib::EventKind::Commented,
+            text: "hi".to_owned(),
+            thread: Vec::new(),
+            added_user: false,
+        });
+        let snapshot = sample_snapshot(vec![row], Vec::new());
+        assert_eq!(
+            screen::next_age(Some(&snapshot), now),
+            Some(Duration::from_millis(step)),
+            "ago {elapsed}"
+        );
+    }
+    let mut soon = sample_row("PRJ", "repo", 1, "Soon", false, false, false);
+    soon.updated_ms = now - 90_000;
+    let mut later = sample_row("PRJ", "repo", 2, "Later", false, false, false);
+    later.updated_ms = now - 500;
+    let both = sample_snapshot(vec![soon], vec![later]);
+    assert_eq!(
+        screen::next_age(Some(&both), now),
+        Some(Duration::from_millis(500))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refresh_file_wakes_and_cancel_ends_the_wait() {
+    use std::os::unix::ffi::OsStrExt;
+    let cwd = watch_dir("refresh-watch");
+    assert!(refresh_os::pipe_pair(-1).is_err());
+    assert!(refresh_os::notify_fd(-1).is_err());
+    assert!(refresh_os::c_path(Path::new("a\0b")).is_err());
+    assert!(refresh_os::c_path(Path::new("state")).is_ok());
+    assert!(refresh_os::bytes_read(0).is_err());
+    assert!(refresh_os::bytes_read(-1).is_err());
+    assert_eq!(refresh_os::bytes_read(4).unwrap(), 4);
+    refresh_os::close_fd(-1);
+    assert!(refresh_os::poll_pair(-1, 0).is_err());
+    assert!(refresh_os::poll_pair(0, -1).is_err());
+    assert!(refresh_os::open(Path::new("/no/such/bistill-refresh")).is_err());
+    assert!(refresh_os::open_with(&cwd, -1).is_err());
+    let (idle_r, idle_w) = refresh_os::pipe_pair(0).unwrap();
+    assert!(refresh_os::poll_for(idle_r, idle_w, 0).is_err());
+    refresh_os::close_fd(idle_r);
+    refresh_os::close_fd(idle_w);
+    let mut zero = vec![0u8; 16];
+    zero.extend(inotify_name(b"refresh"));
+    assert!(refresh_os::names_refresh(&zero));
+    assert!(refresh_os::open(Path::new("a\0b")).is_err());
+    let odd = std::ffi::OsStr::from_bytes(&[0xff]);
+    assert!(refresh_os::c_path(Path::new(odd)).is_ok());
+    assert!(!refresh_os::names_refresh(&[]));
+    assert!(!refresh_os::names_refresh(&[0; 8]));
+    let mut truncated = vec![0u8; 16];
+    truncated[12..16].copy_from_slice(&100u32.to_ne_bytes());
+    assert!(!refresh_os::names_refresh(&truncated));
+    assert!(!refresh_os::names_refresh(&inotify_name(b"other")));
+    assert!(refresh_os::names_refresh(&inotify_name(b"refresh")));
+    let mut bare = vec![0u8; 16];
+    bare[12..16].copy_from_slice(&7u32.to_ne_bytes());
+    bare.extend_from_slice(b"refresh");
+    assert!(refresh_os::names_refresh(&bare));
+    let mut both = inotify_name(b"other");
+    both.extend(inotify_name(b"refresh"));
+    assert!(refresh_os::names_refresh(&both));
+
+    let watch = refresh_os::open(&cwd).unwrap();
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| watch.wait());
+        fs::write(cwd.join("noise"), b"").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        fs::write(cwd.join("refresh"), b"").unwrap();
+        assert!(waiting.join().unwrap().unwrap());
+    });
+    let watch = refresh_os::open(&cwd).unwrap();
+    thread::scope(|scope| {
+        let waiting = scope.spawn(|| watch.wait());
+        watch.cancel();
+        assert!(!waiting.join().unwrap().unwrap());
+    });
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[cfg(unix)]
+fn inotify_name(name: &[u8]) -> Vec<u8> {
+    let mut body = name.to_vec();
+    if !body.contains(&0) {
+        body.push(0);
+    }
+    let mut buf = vec![0u8; 16];
+    buf[12..16].copy_from_slice(&(body.len() as u32).to_ne_bytes());
+    buf.extend(body);
+    buf
+}
+
+#[test]
+fn watch_reports_config_and_lock_errors() {
     let cwd = watch_dir("watch-lock-err");
     fs::create_dir(cwd.join("poll.lock")).unwrap();
     let mut session = poller(&cwd, Vec::new());
-    let (code, stderr) = run_watch(&cwd, &mut session);
+    let (code, stderr) = run_watch(&cwd, &mut session, true);
     assert_eq!(code, 1, "{stderr}");
     fs::remove_dir_all(&cwd).unwrap();
 
     let cwd = watch_dir("watch-quiet");
     let mut session = poller(&cwd, vec![listed_ok(Vec::new())]);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let code = execute(
-        &args(&["watch"]),
-        &cwd,
-        &env_token(),
-        &mut stdout,
-        &mut stderr,
-        &mut session,
-    );
-    assert_eq!(code, 0, "{}", String::from_utf8(stderr).unwrap());
+    let (code, stderr) = run_watch(&cwd, &mut session, false);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty());
     fs::remove_dir_all(&cwd).unwrap();
 }
 
@@ -2575,23 +2786,11 @@ impl Session for Inbox {
         Err(Error::Auth("unused".to_owned()))
     }
 
-    fn list(
-        &mut self,
-        _: &Client,
-        _: u64,
-        _: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
-    ) -> Result<Listed, Error> {
-        Err(Error::Auth("unused".to_owned()))
-    }
-
-    fn notify(&mut self, _: &host::Toast) -> Result<(), host::Error> {
-        Ok(())
-    }
-
     fn poll(
         &mut self,
         _: &Client,
         _: u64,
+        _cached: &[Row],
         publish: &mut dyn FnMut(&Snapshot) -> Result<(), Error>,
     ) -> Result<Listed, bistill_lib::InboxFault> {
         self.polls += 1;
@@ -2617,9 +2816,10 @@ impl Session for Inbox {
         self.now
     }
 
-    fn pause(&mut self, _: Duration) {
+    fn pause(&mut self, _: Duration, _: &std::sync::mpsc::Receiver<Nudge>) -> Paused {
         self.now += self.jump;
         std::thread::yield_now();
+        Paused::Elapsed
     }
 
     fn again(&mut self) -> bool {
@@ -2643,8 +2843,24 @@ fn feed(steps: Vec<Result<Listed, bistill_lib::InboxFault>>) -> Inbox {
 
 enum DriveStep {
     Until(String),
-    Run(Box<dyn FnMut()>),
     Event(tui::Event),
+    /// Return once without an event so the draw thread can wait on an age.
+    Idle,
+}
+
+struct DrivePark(std::sync::Arc<tui::Gate>);
+
+impl tui::Park for DrivePark {
+    fn park(&self, seen: u64) -> u64 {
+        match self.0.park_for(seen, Duration::from_secs(8)) {
+            Some(generation) => generation,
+            None => panic!("stalled"),
+        }
+    }
+
+    fn unpark(&self) {
+        self.0.unpark();
+    }
 }
 
 struct Drive {
@@ -2653,6 +2869,7 @@ struct Drive {
     fetch_seen: bool,
     queue: std::collections::VecDeque<DriveStep>,
     spins: u32,
+    gate: std::sync::Arc<tui::Gate>,
 }
 
 impl Drive {
@@ -2663,6 +2880,7 @@ impl Drive {
             fetch_seen: false,
             queue: queue.into(),
             spins: 0,
+            gate: tui::Gate::new(),
         }
     }
 }
@@ -2679,6 +2897,11 @@ impl tui::Backend for Drive {
 
     fn draw(&mut self, buffer: &tui::Buffer) {
         self.grid.draw(buffer);
+        tui::Park::unpark(&*self.gate);
+    }
+
+    fn parking(&self) -> std::sync::Arc<dyn tui::Park> {
+        std::sync::Arc::new(DrivePark(self.gate.clone()))
     }
 
     fn poll(&mut self, timeout: Duration) -> Option<tui::Event> {
@@ -2701,10 +2924,9 @@ impl tui::Backend for Drive {
                     std::thread::yield_now();
                     return None;
                 }
-                Some(DriveStep::Run(_)) => {
-                    if let Some(DriveStep::Run(mut run)) = self.queue.pop_front() {
-                        run();
-                    }
+                Some(DriveStep::Idle) => {
+                    self.queue.pop_front();
+                    return None;
                 }
                 Some(DriveStep::Event(_)) => {
                     if let Some(DriveStep::Event(event)) = self.queue.pop_front() {
@@ -2740,6 +2962,24 @@ fn step_key(ch: char) -> DriveStep {
 }
 
 #[test]
+fn tui_repaints_when_an_age_changes() {
+    let cwd = watch_dir("tui-age");
+    let mut row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    row.updated_ms = crate::unix_ms(std::time::SystemTime::now()).saturating_sub(400);
+    let mut session = feed(vec![listed_ok(vec![row])]);
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        DriveStep::Idle,
+        step_key('q'),
+    ]);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
 fn tui_holder_opens_refreshes_and_releases_the_lock() {
     let cwd = watch_dir("tui-holder");
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -2766,7 +3006,8 @@ fn tui_holder_opens_refreshes_and_releases_the_lock() {
     ]);
     backend.barrier = Some(barrier);
     let mut opened = Vec::new();
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |url| {
         opened.push(url.to_owned());
         if opened.len() == 1 {
@@ -2794,6 +3035,143 @@ fn tui_holder_opens_refreshes_and_releases_the_lock() {
 }
 
 #[test]
+fn tui_marks_read_and_ignores_from_the_keys() {
+    let cwd = watch_dir("tui-mark");
+    fs::write(
+        cwd.join("watermarks.json"),
+        r#"{"items":[{"id":"PRJ/repo/12","activity_id":1,"ignored":true,"primed":true,"seen_failed":false,"seen_conflict":false}]}"#,
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('i'),
+        step_key('i'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    let marks = fs::read_to_string(cwd.join("watermarks.json")).unwrap();
+    assert!(marks.contains("PRJ/repo/12"));
+    assert!(marks.contains("\"ignored\":true"));
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn tui_logs_a_watermark_that_cannot_be_read() {
+    let cwd = watch_dir("tui-mark-dir");
+    fs::create_dir(cwd.join("watermarks.json")).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    assert_eq!(exit.code, 0, "{}", exit.stderr);
+    assert!(!exit.stderr.is_empty());
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_logs_a_watermark_that_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let cwd = watch_dir("tui-mark-ro");
+    let log = cwd.join("logs");
+    fs::create_dir(&log).unwrap();
+    fs::write(
+        cwd.join("bistill.conf"),
+        format!(
+            "state_dir = {}\npoll_seconds = 15\nlog_file = {}\n",
+            cwd.display(),
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::write(cwd.join("watermarks.json"), b"{\"items\":[]}").unwrap();
+    fs::set_permissions(
+        cwd.join("watermarks.json"),
+        fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut session = feed(vec![listed_ok(vec![sample_row(
+        "PRJ",
+        "repo",
+        12,
+        "Fix the pipe",
+        false,
+        false,
+        false,
+    )])]);
+    session.barrier = Some(barrier.clone());
+    let mut backend = Drive::new(vec![
+        DriveStep::Until("Fix the pipe".to_owned()),
+        step_key('m'),
+        step_key('q'),
+    ]);
+    backend.barrier = Some(barrier);
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
+    fs::set_permissions(
+        cwd.join("watermarks.json"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    fs::remove_dir_all(&cwd).unwrap();
+}
+
+#[test]
+fn ignore_skips_a_missing_row_and_marks_the_author() {
+    let snapshot = sample_snapshot(
+        vec![sample_row(
+            "PRJ",
+            "repo",
+            12,
+            "Fix the pipe",
+            false,
+            false,
+            false,
+        )],
+        Vec::new(),
+    );
+    let mut store = bistill_lib::Store::default();
+    crate::app::apply_ignore(&mut store, &snapshot, "missing");
+    crate::app::apply_ignore(&mut store, &snapshot, "PRJ/repo/12");
+    assert!(bistill_lib::is_ignored(&store, "PRJ/repo/12"));
+}
+
+#[test]
 fn tui_shows_token_rejected_and_a_failed_poll() {
     let cwd = watch_dir("tui-auth");
     let log = cwd.join("bistill.log");
@@ -2816,7 +3194,8 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
         step_key('q'),
     ]);
     backend.barrier = Some(barrier);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(drive_text(&backend.grid).contains("Fix the pipe"));
@@ -2834,7 +3213,8 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
     session.barrier = Some(barrier.clone());
     let mut backend = Drive::new(vec![DriveStep::Until("HTTP 500".to_owned()), step_key('q')]);
     backend.barrier = Some(barrier);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(drive_text(&backend.grid).contains("HTTP 500"));
@@ -2845,38 +3225,16 @@ fn tui_shows_token_rejected_and_a_failed_poll() {
 }
 
 #[test]
-fn tui_viewer_rereads_and_leaves_the_holder() {
+fn tui_second_process_names_the_lock_pid() {
     let cwd = watch_dir("tui-viewer");
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
-    let first = cwd.clone();
-    let second = cwd.clone();
-    let garbage = cwd.clone();
-    let mut backend = Drive::new(vec![
-        DriveStep::Until("Fetching from Bitbucket...".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            let row = sample_row("PRJ", "repo", 12, "First pipe", false, false, false);
-            bistill_lib::write_snapshot(&first, &sample_snapshot(vec![row], Vec::new())).unwrap();
-        })),
-        DriveStep::Until("First pipe".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            let row = sample_row("PRJ", "repo", 13, "Second pipe", false, false, false);
-            bistill_lib::write_snapshot(&second, &sample_snapshot(vec![row], Vec::new())).unwrap();
-        })),
-        DriveStep::Until("Second pipe".to_owned()),
-        DriveStep::Run(Box::new(move || {
-            fs::write(garbage.join("snapshot.json"), b"{").unwrap();
-        })),
-        step_key('r'),
-        step_key('q'),
-    ]);
+    let mut backend = Drive::new(Vec::new());
     let mut session = feed(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
-    assert_eq!(exit.code, 0, "{}", exit.stderr);
-    let text = drive_text(&backend.grid);
-    assert!(text.contains("Second pipe"));
-    assert!(text.contains(&format!("Holder {}.", std::process::id())));
-    assert!(cwd.join("refresh").is_file());
+    assert_eq!(exit.code, 1, "{}", exit.stderr);
+    assert!(exit.stderr.contains(&std::process::id().to_string()));
     assert_eq!(
         fs::read_to_string(cwd.join("poll.lock")).unwrap().trim(),
         std::process::id().to_string()
@@ -2902,7 +3260,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
         DriveStep::Until("Fix the pipe".to_owned()),
         step_key('q'),
     ]);
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 0, "{}", exit.stderr);
     assert!(!cwd.join("poll.lock").exists());
@@ -2915,7 +3274,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
         retry_after_ms: None,
     })]);
     let mut backend = Drive::new(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 2, "{}", exit.stderr);
     assert!(exit.stderr.contains("curl must be on PATH."));
@@ -2934,7 +3294,8 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
     fs::write(cwd.join("poll.lock"), format!("{}\n", std::process::id())).unwrap();
     let mut backend = Drive::new(vec![step_key('q')]);
     let mut session = feed(Vec::new());
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
     assert_eq!(exit.code, 1, "{}", exit.stderr);
     fs::remove_dir_all(&cwd).unwrap();
@@ -2949,7 +3310,7 @@ fn tui_quits_during_the_wait_and_reports_a_missing_curl() {
 #[test]
 fn tui_prepare_and_phases() {
     let cwd = watch_dir("tui-config");
-    let err = match prepare(&cwd, &Env::new()) {
+    let err = match prepare(&cwd, &bistill_lib::Flags::default(), &Env::new(), false) {
         Err(err) => err,
         Ok(_) => panic!("config"),
     };
@@ -2957,7 +3318,7 @@ fn tui_prepare_and_phases() {
     assert!(!err.stderr.is_empty());
 
     fs::write(cwd.join("snapshot.json"), b"{").unwrap();
-    let err = match prepare(&cwd, &env_token()) {
+    let err = match prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false) {
         Err(err) => err,
         Ok(_) => panic!("json"),
     };
@@ -2965,7 +3326,8 @@ fn tui_prepare_and_phases() {
 
     fs::remove_file(cwd.join("snapshot.json")).unwrap();
     fs::create_dir(cwd.join("poll.lock")).unwrap();
-    let prepared = prepare(&cwd, &env_token()).unwrap_or_else(|exit| panic!("{}", exit.stderr));
+    let prepared = prepare(&cwd, &bistill_lib::Flags::default(), &env_token(), false)
+        .unwrap_or_else(|exit| panic!("{}", exit.stderr));
     let mut backend = tui::TestBackend::new(40, 8);
     let mut session = feed(Vec::new());
     let exit = drive(&mut backend, prepared, &mut session, &mut |_| Ok(()));
@@ -3027,4 +3389,171 @@ fn tui_prepare_and_phases() {
     }
     let offset = super::zone_os::local_offset_secs();
     assert!(offset.unsigned_abs() <= 24 * 60 * 60);
+}
+
+#[test]
+fn help_box_covers_the_inbox_and_keys_mark_or_ignore() {
+    let mut row = sample_row("PRJ", "repo", 12, "Fix the pipe", false, false, false);
+    row.events = vec![
+        bistill_lib::Event {
+            id: 5,
+            created_ms: 1,
+            actor_slug: "ada".to_owned(),
+            actor_name: "Ada".to_owned(),
+            kind: bistill_lib::EventKind::Commented,
+            text: "please look".to_owned(),
+            thread: vec!["ada".to_owned()],
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 4,
+            created_ms: 1,
+            actor_slug: "jcitizen".to_owned(),
+            actor_name: "Jane".to_owned(),
+            kind: bistill_lib::EventKind::Pushed,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 3,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Approved,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 2,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Reopened,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+        bistill_lib::Event {
+            id: 1,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Added,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: true,
+        },
+        bistill_lib::Event {
+            id: 0,
+            created_ms: 1,
+            actor_slug: "sam".to_owned(),
+            actor_name: "Sam".to_owned(),
+            kind: bistill_lib::EventKind::Other,
+            text: String::new(),
+            thread: Vec::new(),
+            added_user: false,
+        },
+    ];
+    let snapshot = sample_snapshot(vec![row], Vec::new());
+    let mut screen = screen::Screen::new();
+    let mut floors = std::collections::BTreeMap::new();
+    floors.insert("PRJ/repo/12".to_owned(), 4);
+    screen.set_marks(floors, std::collections::BTreeSet::new());
+    let grid = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    let text = grid_text(&grid);
+    assert!(text.contains("new "));
+    assert_eq!(find_style(&grid, "new").fg, Some(tui::Color::Green));
+    assert!(text.contains("please look"));
+    assert!(text.contains("pushed"));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('m')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(matches!(
+        screen.take_pending(),
+        Some(screen::Pending::Read(id)) if id == "PRJ/repo/12"
+    ));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('i')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(matches!(
+        screen.take_pending(),
+        Some(screen::Pending::Ignore(id)) if id == "PRJ/repo/12"
+    ));
+    let mut ignored = std::collections::BTreeSet::new();
+    ignored.insert("PRJ/repo/12".to_owned());
+    screen.set_marks(std::collections::BTreeMap::new(), ignored);
+    let badged = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    assert!(grid_text(&badged).contains("ignored"));
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('?')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    let help = draw_screen(
+        &mut screen,
+        160,
+        24,
+        Some(&snapshot),
+        &screen::Role::Holder(screen::Phase::Ready),
+        0,
+    );
+    let help_text = grid_text(&help);
+    assert!(help_text.contains("Mark this pull request"));
+    assert!(help_text.contains("Fix the pipe"));
+    assert!(row_text(&help, 23).contains("close"));
+    assert_eq!(
+        act(&mut screen, key(tui::KeyCode::Tab), Some(&snapshot), 0),
+        screen::Action::None
+    );
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('m')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert_eq!(
+        act(
+            &mut screen,
+            key(tui::KeyCode::Char('i')),
+            Some(&snapshot),
+            0
+        ),
+        screen::Action::None
+    );
+    assert!(screen.take_pending().is_none());
 }

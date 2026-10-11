@@ -124,6 +124,44 @@ pub enum ReviewStatus {
     Approved,
 }
 
+/// What an activity did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EventKind {
+    /// `COMMENTED`.
+    Commented,
+    /// `APPROVED`.
+    Approved,
+    /// `UPDATED` commits.
+    Pushed,
+    /// `REOPENED`.
+    Reopened,
+    /// This user was added as a reviewer.
+    Added,
+    /// An activity the tray rules do not name.
+    Other,
+}
+
+/// One pull-request activity, newest stored with the row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Event {
+    /// Activity `id`, or `createdDate` when the body has no id.
+    pub id: u64,
+    /// `createdDate`.
+    pub created_ms: u64,
+    /// Actor slug.
+    pub actor_slug: String,
+    /// Actor display name.
+    pub actor_name: String,
+    /// Short verb for the detail line.
+    pub kind: EventKind,
+    /// Comment text or commit subject.
+    pub text: String,
+    /// Slugs that wrote in this comment thread.
+    pub thread: Vec<String>,
+    /// The activity added the current user as a reviewer.
+    pub added_user: bool,
+}
+
 /// An OPEN pull request in one section.
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -173,14 +211,18 @@ pub struct Row {
     pub can_merge: bool,
     /// Lowercase hex record. Empty until the row is placed in a section.
     pub fingerprint: String,
+    /// Activities fetched for this pull request. Empty until that fetch finishes.
+    pub events: Vec<Event>,
+    /// True after an activity fetch has been applied, including an empty page.
+    pub events_loaded: bool,
 }
 
 /// The two sections, oldest update first.
 #[derive(Debug)]
 pub struct Sections {
-    /// OPEN rows where this user's reviewer status is `UNAPPROVED` or `NEEDS_WORK`.
+    /// OPEN rows where this user is a reviewer.
     pub needs_review: Vec<Row>,
-    /// OPEN rows this user authored, when they are not in Needs review.
+    /// OPEN rows this user authored and is not reviewing.
     pub waiting: Vec<Row>,
 }
 
@@ -196,9 +238,8 @@ pub fn parse_page(body: &[u8]) -> Result<InboxPage, Error> {
 
 /// Classify `prs` for `username`.
 ///
-/// Merged and declined rows are omitted. A user who is both author and reviewer
-/// lands in Needs review when their reviewer status is `UNAPPROVED` or
-/// `NEEDS_WORK`. `html_url` uses a UI link when the page has one, otherwise
+/// Merged and declined rows are omitted. A user who is a reviewer lands in
+/// Needs review, including when they also wrote the pull request. `html_url` uses a UI link when the page has one, otherwise
 /// `{base_url}/projects/{project}/repos/{repo}/pull-requests/{number}`.
 /// `stale` is set on Waiting when `now_ms - updated_ms` exceeds `stale_days`.
 pub fn classify(
@@ -250,15 +291,12 @@ fn place(pr: &PullRequest, username: &str) -> Option<Place> {
     if pr.state != State::Open {
         return None;
     }
-    if let Some(status) = pr
+    if pr
         .reviewers
         .iter()
-        .find(|reviewer| reviewer.slug.eq_ignore_ascii_case(username))
-        .map(|reviewer| reviewer.status)
+        .any(|reviewer| reviewer.slug.eq_ignore_ascii_case(username))
     {
-        if status == ReviewStatus::Unapproved || status == ReviewStatus::NeedsWork {
-            return Some(Place::NeedsReview);
-        }
+        return Some(Place::NeedsReview);
     }
     if pr.author.slug.eq_ignore_ascii_case(username) {
         return Some(Place::Waiting);
@@ -302,6 +340,8 @@ fn row_from(pr: &PullRequest, base_url: &str, stale: bool, needs_work: bool) -> 
         conflicted: false,
         can_merge: false,
         fingerprint: String::new(),
+        events: Vec::new(),
+        events_loaded: false,
     }
 }
 

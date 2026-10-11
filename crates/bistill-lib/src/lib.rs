@@ -7,6 +7,7 @@
 
 #![deny(unsafe_code)]
 
+mod activity;
 mod config;
 mod enrich;
 mod fingerprint;
@@ -14,14 +15,15 @@ mod inbox;
 mod list;
 mod notify;
 mod ping;
+mod watermark;
 
 pub use config::{Config, Dirs, Env, Flags, PollSeconds, load};
 pub use fingerprint::{
     Change, Reason, Section, diff, parse_snapshot, read_snapshot, stamp, write_snapshot,
 };
 pub use inbox::{
-    Build, Enrichment, InboxPage, PageEnd, PullRequest, ReviewStatus, Reviewer, Row, Sections,
-    State, UserRef, classify, parse_page,
+    Build, Enrichment, Event, EventKind, InboxPage, PageEnd, PullRequest, ReviewStatus, Reviewer,
+    Row, Sections, State, UserRef, classify, parse_page,
 };
 pub use json::Error as JsonError;
 pub use list::{
@@ -32,6 +34,10 @@ pub use notify::{TITLE, toast_body};
 pub use ping::{
     Bodies, Client, CurlFetch, Fetch, InboxCount, Product, Report, TIMEOUT, USER_AGENT, User,
     parse_inbox, parse_product, parse_user, ping, ping_with,
+};
+pub use watermark::{
+    Mark, Store, caught_up, is_ignored, mark_read, prime, read_store, toggle_ignore, unread_count,
+    write_store,
 };
 
 use std::ffi::OsString;

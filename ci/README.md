@@ -7,6 +7,8 @@ docker compose run --rm ci
 docker compose run --rm codeql
 ```
 
+Both jobs use the host network, so TLS follows the host route. A bridge drops the handshake when that route is a VPN.
+
 `compose.yaml` builds `ci/Dockerfile` and mounts this tree at `/src`. The image installs the same tool versions GitHub uses, so the commands below match the pull request checks.
 
 ## The test job
